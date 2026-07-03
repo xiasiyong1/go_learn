@@ -4,11 +4,45 @@
 
 Go 内存模型中的 happens-before 怎么理解？
 
-## 核心答案
+## 先给结论
 
-happens-before 描述并发操作之间的可见性顺序。如果 A happens-before B，那么 B 能看到 A 在此之前完成的内存写入。
+Go 内存模型定义了并发程序中一个 goroutine 的写入何时对另一个 goroutine 可见。happens-before 是推理同步正确性的核心关系。
 
-互斥锁的 Unlock happens-before 后续 Lock；channel 发送 happens-before 对应接收；close channel happens-before 接收方观察到关闭；atomic 操作也提供特定同步语义。
+## 深入理解
+
+### 1. 这道题真正考察什么
+
+- 是否知道没有同步的数据共享就是数据竞争。
+- 是否能举出 channel、mutex、atomic 建立 happens-before 的例子。
+- 是否能区分数据竞争和业务竞态。
+- 是否知道不要依赖“看起来先执行”的日志顺序推断内存可见性。
+
+### 2. 底层机制要讲清楚
+
+- 如果 A happens-before B，那么 B 能看到 A 之前的写入结果。
+- Unlock happens-before 后续成功 Lock。
+- channel 发送 happens-before 对应接收，close happens-before 接收方观察到关闭。
+- atomic 操作提供特定同步语义，但所有相关访问都要使用 atomic。
+
+### 3. 工程实践怎么取舍
+
+- 共享可变状态必须通过明确同步原语保护。
+- 优先设计清晰所有权，减少共享写入。
+- 用 channel 传递数据时，把数据准备好再发送，让接收方通过同步关系看到完整状态。
+- 复杂状态用锁保护不变量，不要用多个无关同步点拼凑。
+
+### 4. 常见误区
+
+- 认为单核或短时间测试没出错就没有数据竞争。
+- 一个变量用锁保护，另一个相关变量没保护，读取组合状态不一致。
+- atomic 和普通读写混用。
+- 用 sleep 作为同步手段。
+
+## 如何验证理解
+
+- 用 race detector 发现缺少同步的数据访问。
+- 写并发测试验证业务不变量，而不仅是无 race。
+- 用代码审查画出 happens-before 链，确认读写之间有同步关系。
 
 ## 代码示例
 
@@ -26,5 +60,8 @@ mu.Unlock()
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 没有数据竞争是否等于逻辑一定正确？
-- channel 如何建立内存可见性？
+- 如果继续追问“Go 内存模型”的底层机制，应该讲到哪些层次？
+- 这个知识点在真实项目里应该如何取舍？
+- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
+- 如何用测试、工具或 profiling 验证自己的判断？
+- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？

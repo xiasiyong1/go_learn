@@ -2,10 +2,59 @@
 
 ## 追问与参考答案
 
-### 1. recover 能捕获其他 goroutine 的 panic 吗？
+### 1. 如果继续追问底层机制，回答应该深入到什么程度？
 
-不能。`recover` 只能捕获当前 goroutine 中正在展开的 panic，其他 goroutine 的 panic 必须在对应 goroutine 内部自己 defer recover。
+不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
 
-### 2. panic 后 defer 是否会执行？
+- panic 发生后，函数停止正常执行，开始沿调用栈执行 defer。
+- recover 成功后，当前 goroutine 可以从 defer 返回，函数返回其返回值。
+- 不同 goroutine 有独立调用栈，一个 goroutine 的 recover 不能跨栈捕获另一个 goroutine 的 panic。
+- runtime 的 fatal error 通常不可 recover，例如并发 map 写导致的 fatal error。
 
-会执行。panic 发生后当前 goroutine 的调用栈开始展开，每一层已经注册的 defer 会按后进先出执行；如果没有 recover，最终程序崩溃。
+面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+
+### 2. 这个知识点在真实项目里怎么取舍？
+
+核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+
+- 库函数通常返回 error，不要让调用方被迫 recover。
+- HTTP middleware、任务执行器、goroutine 启动边界可以 recover 并记录堆栈，避免进程直接崩溃。
+- recover 后要把 panic 转成明确错误或日志，不要静默吞掉。
+- 内部不变量被破坏时可以 panic，但要让边界清晰。
+
+如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+
+### 3. 这道题最容易追问哪些坑？
+
+面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+
+- 把 panic 当异常机制写业务分支。
+- 在 goroutine 外层没有 recover，导致后台任务 panic 杀死进程。
+- recover 后不记录堆栈，问题根因丢失。
+- 以为所有 panic 都能 recover，包括 fatal error。
+
+回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+
+### 4. 如何证明你的判断是对的？
+
+Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+
+- 写小例子验证 recover 的调用位置和 goroutine 边界。
+- 为 goroutine wrapper 写单测，确认 panic 会被转成错误或日志。
+- 在线上服务中配合 structured log 输出 panic 值和 stack trace。
+
+如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+
+### 5. 当规模变大后，这个问题会如何升级？
+
+很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+
+- 命令行小工具可以让不可恢复错误直接退出。
+- 长期运行服务必须在请求边界和任务边界兜底 recover。
+- 系统越复杂，越要限制 panic 的使用范围，否则控制流难以维护。
+
+面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+
+### 6. 初学者应该怎么把这个问题学扎实？
+
+建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。

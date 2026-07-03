@@ -2,6 +2,8 @@
 
 这个仓库用于整理 Go 面试题。`README.md` 只做索引，每道题一个目录：`index.md` 放主答案和追问题目，`follow-ups.md` 放追问参考答案。
 
+每道题的答案按“先给结论 -> 深入理解 -> 工程取舍 -> 常见误区 -> 验证方式 -> 面试追问”组织。目标不是让初学者背答案，而是帮助读者沿着语言语义、底层机制和真实工程场景逐层理解，回答时能讲清楚“是什么、为什么、怎么验证、规模变大后会怎样”。
+
 难度排序按学习和面试深度从简单到困难排列。难度不是绝对标准，同一个问题在不同公司可能会继续追问到底层实现。
 
 ## 简单
@@ -23,6 +25,18 @@
 | 018 | 比较 | Go 中哪些类型可以比较？`comparable` 表示什么？ | [答案](interview/answers/018-comparable/index.md) |
 | 019 | for range | `for range` 有哪些常见坑？ | [答案](interview/answers/019-for-range-pitfalls/index.md) |
 | 020 | JSON | Go 结构体 JSON 序列化有哪些常见规则和坑？ | [答案](interview/answers/020-json-struct-tag/index.md) |
+| 061 | 变量 | Go 中 `var`、短变量声明和变量遮蔽应该怎么理解？ | [答案](interview/answers/061-variable-declaration-shadowing/index.md) |
+| 062 | 基础类型 | Go 的基础数值类型、类型转换和溢出规则有哪些需要注意？ | [答案](interview/answers/062-basic-types-conversion-overflow/index.md) |
+| 063 | 控制流 | Go 的 `if`、`switch` 和条件初始化语句有哪些特点？ | [答案](interview/answers/063-if-switch-control-flow/index.md) |
+| 064 | 循环 | Go 为什么只有 `for` 循环？`break`、`continue` 和标签怎么用？ | [答案](interview/answers/064-for-break-continue-label/index.md) |
+| 065 | 切片操作 | Go 中切片的追加、删除、插入和过滤应该怎么写？ | [答案](interview/answers/065-slice-common-operations/index.md) |
+| 066 | map 操作 | Go map 的查找、删除、零值返回和 `comma ok` 应该怎么理解？ | [答案](interview/answers/066-map-common-operations/index.md) |
+| 067 | 结构体嵌入 | Go 结构体嵌入、字段提升和方法提升应该怎么理解？ | [答案](interview/answers/067-struct-embedding-promotion/index.md) |
+| 068 | 接口 | Go 的接口为什么是隐式实现？接口应该由谁来定义？ | [答案](interview/answers/068-implicit-interface-satisfaction/index.md) |
+| 069 | nil | Go 中哪些类型可以是 nil？不同 nil 值的行为有什么区别？ | [答案](interview/answers/069-nil-kinds/index.md) |
+| 070 | 时间 | Go 中 `time.Time`、`time.Duration`、时区和单调时间应该怎么理解？ | [答案](interview/answers/070-time-duration-timezone/index.md) |
+| 071 | 格式化 | `fmt` 常用格式化占位符和 `Stringer` 接口应该怎么用？ | [答案](interview/answers/071-fmt-stringer-formatting/index.md) |
+| 072 | I/O | `io.Reader`、`io.Writer` 和 `io.EOF` 应该怎么理解？ | [答案](interview/answers/072-io-reader-writer-eof/index.md) |
 
 ## 中等
 
@@ -52,6 +66,18 @@
 | 038 | 测试 | Go 表格驱动测试、子测试和 mock 应该怎么写？ | [答案](interview/answers/038-testing/index.md) |
 | 039 | race | Go race detector 能发现什么？不能发现什么？ | [答案](interview/answers/039-race-detector/index.md) |
 | 040 | module | Go Module 的版本、replace 和 vendor 怎么理解？ | [答案](interview/answers/040-go-module/index.md) |
+| 073 | HTTP client | Go HTTP client 的超时、连接复用和响应体关闭有哪些坑？ | [答案](interview/answers/073-http-client-timeout-reuse/index.md) |
+| 074 | database/sql | `database/sql` 的连接池、事务和 Rows 关闭应该怎么理解？ | [答案](interview/answers/074-database-sql-pool-transaction/index.md) |
+| 075 | 并发错误 | 多个 goroutine 并发执行时，错误收集和取消传播应该怎么做？ | [答案](interview/answers/075-errgroup-error-propagation/index.md) |
+| 076 | 并发模式 | fan-in、fan-out 和背压在 Go 并发里应该怎么设计？ | [答案](interview/answers/076-fan-in-fan-out-backpressure/index.md) |
+| 077 | 并发限制 | Go 中如何用信号量限制并发？和 worker pool 有什么区别？ | [答案](interview/answers/077-semaphore-concurrency-limit/index.md) |
+| 078 | HTTP server | Go HTTP server 中 middleware、request context 和超时应该怎么设计？ | [答案](interview/answers/078-http-server-middleware-context/index.md) |
+| 079 | 反射 | Go 反射能做什么？为什么说反射要谨慎使用？ | [答案](interview/answers/079-reflection-basics/index.md) |
+| 080 | 构建 | Go build tags 和按平台条件编译应该怎么用？ | [答案](interview/answers/080-build-tags-conditional-compilation/index.md) |
+| 081 | 排序 | Go 中 slice 排序、map 稳定输出和自定义比较应该怎么做？ | [答案](interview/answers/081-sorting-slices-maps/index.md) |
+| 082 | 配置 | Go 服务中的配置、环境变量和命令行参数应该怎么管理？ | [答案](interview/answers/082-configuration-env-flags/index.md) |
+| 083 | 日志 | Go 服务日志应该怎么打？结构化日志和 context 有什么关系？ | [答案](interview/answers/083-logging-observability-basics/index.md) |
+| 084 | 可测试性 | Go 中依赖注入应该怎么做？如何让代码更容易测试？ | [答案](interview/answers/084-dependency-injection-testability/index.md) |
 
 ## 困难
 
@@ -84,5 +110,5 @@
 新增题目时继续按难度分组追加，答案文件保持编号前缀：
 
 ```markdown
-| 061 | 主题 | 问题 | [答案](对应题目目录/index.md) |
+| 085 | 主题 | 问题 | [答案](对应题目目录/index.md) |
 ```
