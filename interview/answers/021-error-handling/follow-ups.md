@@ -1,60 +1,179 @@
 # 021. error 处理 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 `%w` 比 `%v` 更适合包装错误？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`%v` 只把错误格式化成文本，丢失 unwrap 链。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+err := fmt.Errorf("read config: %v", os.ErrNotExist)
 
-- 显式 error 让调用者必须面对失败路径，避免异常式控制流隐藏在任意位置。
-- 错误包装保留上下文，同时通过 unwrap 链保留原始错误。
-- 哨兵错误适合稳定、少量、需要相等判断的错误语义。
-- 自定义错误类型适合携带结构化字段，让上层根据字段决策。
+fmt.Println(errors.Is(err, os.ErrNotExist)) // false
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+`%w` 会保留原始错误：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+err := fmt.Errorf("read config: %w", os.ErrNotExist)
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+fmt.Println(errors.Is(err, os.ErrNotExist)) // true
+```
 
-- 底层返回错误时添加关键上下文，例如操作、资源 ID、依赖名称。
-- 跨包暴露的错误语义要稳定，不要随意改哨兵错误或类型。
-- 日志只在合适边界记录，避免每层都打同一个错误。
-- 不要吞掉错误；确实忽略时写明原因。
+所以底层错误需要被上层识别时，应该用 `%w`。如果只是输出文本，不需要错误语义，才考虑 `%v`。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. `errors.Is` 和 `errors.As` 分别解决什么问题？
 
-### 3. 这道题最容易追问哪些坑？
+`errors.Is` 判断错误链里是否包含某个目标错误。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+var ErrNotFound = errors.New("not found")
 
-- 用 `fmt.Errorf("... %v", err)` 丢失 unwrap 链。
-- 调用方匹配错误字符串，导致文案变化破坏逻辑。
-- 每层都记录日志，最终一条失败刷出多条重复日志。
-- 把 panic 当作普通业务错误处理。
+err := fmt.Errorf("load user: %w", ErrNotFound)
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+fmt.Println(errors.Is(err, ErrNotFound)) // true
+```
 
-### 4. 如何证明你的判断是对的？
+`errors.As` 从错误链里提取某种错误类型。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+var pathErr *fs.PathError
+if errors.As(err, &pathErr) {
+	fmt.Println(pathErr.Op, pathErr.Path)
+}
+```
 
-- 写测试验证 `errors.Is` 和 `errors.As` 在包装后仍然生效。
-- 对公共错误类型写兼容性测试。
-- 在接口层测试错误到 HTTP 状态码、重试策略或用户提示的映射。
+一句话：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+- `Is` 适合判断“是不是这个错误语义”。
+- `As` 适合拿到“这个错误类型里的结构化字段”。
 
-### 5. 当规模变大后，这个问题会如何升级？
+## 3. 什么时候用哨兵错误，什么时候用自定义错误类型？
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+哨兵错误适合少量、稳定、只需要判断类别的错误。
 
-- 小程序中直接返回 error 就足够。
-- 服务化系统里，错误需要支撑日志、指标、重试、告警和用户反馈。
-- 跨服务错误还要考虑错误码和协议兼容，不应直接暴露内部 Go 错误字符串。
+```go
+var ErrNotFound = errors.New("not found")
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+调用方只关心是不是 not found：
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```go
+if errors.Is(err, ErrNotFound) {
+	return nil
+}
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+自定义错误类型适合携带结构化信息：
+
+```go
+type RateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	return "rate limited"
+}
+```
+
+调用方可以提取字段做决策：
+
+```go
+var e *RateLimitError
+if errors.As(err, &e) {
+	time.Sleep(e.RetryAfter)
+}
+```
+
+## 4. 为什么不建议靠错误字符串做业务判断？
+
+错误字符串是给人看的，不是稳定协议。
+
+不推荐：
+
+```go
+if strings.Contains(err.Error(), "timeout") {
+	retry()
+}
+```
+
+文案变化、依赖升级、语言变化都可能破坏判断。
+
+推荐定义稳定错误语义：
+
+```go
+var ErrTimeout = errors.New("timeout")
+
+if errors.Is(err, ErrTimeout) {
+	retry()
+}
+```
+
+或者定义接口：
+
+```go
+type Temporary interface {
+	Temporary() bool
+}
+
+var te Temporary
+if errors.As(err, &te) && te.Temporary() {
+	retry()
+}
+```
+
+## 5. 错误日志应该每层都打吗？
+
+通常不应该。
+
+底层负责加上下文：
+
+```go
+func loadUser(id int64) error {
+	if err := queryUser(id); err != nil {
+		return fmt.Errorf("query user %d: %w", id, err)
+	}
+	return nil
+}
+```
+
+边界层负责记录：
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+	if err := loadUser(1); err != nil {
+		slog.Error("request failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+```
+
+每层都打日志会产生重复日志，反而让排查更难。
+
+## 6. 普通业务错误为什么不应该用 panic 表达？
+
+因为业务错误是预期失败，调用方应该能正常处理。
+
+不推荐：
+
+```go
+func ParseAge(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+```
+
+推荐：
+
+```go
+func ParseAge(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("parse age: %w", err)
+	}
+	return n, nil
+}
+```
+
+`panic` 更适合程序员错误、不可恢复的不变量破坏，或者在 goroutine/HTTP 框架边界做兜底 recover。

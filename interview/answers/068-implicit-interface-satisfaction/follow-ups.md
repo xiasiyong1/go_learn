@@ -1,60 +1,169 @@
 # 068. 接口 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 Go 不需要 `implements` 关键字？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为 Go 用结构化类型关系判断接口实现：只看方法集是否匹配，不看类型是否显式声明。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type Doer interface {
+	Do() error
+}
 
-- 编译器根据类型方法集和接口方法集判断实现关系。
-- 值类型和指针类型的方法集不同，影响接口实现。
-- 隐式实现让类型可以在不依赖接口包的情况下满足接口。
-- 接口变量保存动态类型和值，运行时调用会进行动态派发。
+type Task struct{}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+func (Task) Do() error {
+	return nil
+}
 
-### 2. 这个知识点在真实项目里怎么取舍？
+func run(d Doer) error {
+	return d.Do()
+}
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+func main() {
+	run(Task{})
+}
+```
 
-- 只为真实使用场景抽象接口，不提前为每个结构体定义接口。
-- 接口方法越少越好，常见如 `io.Reader` 只有一个核心方法。
-- 使用编译期断言记录关键实现关系。
-- mock 需求出现时，优先在调用方定义最小接口。
+这种方式让 `Task` 不需要知道 `Doer` 的存在。后续另一个包定义了同样方法需求的接口，`Task` 也能自然满足。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+代价是：接口实现关系不一定一眼可见，所以关键位置可以用编译期断言补充说明。
 
-### 3. 这道题最容易追问哪些坑？
+## 2. 为什么说接口应该由使用方定义？
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+使用方知道自己需要什么。生产者往往容易定义过大的接口。
 
-- 在生产者包里为每个 struct 配一个大接口。
-- 接口方法过多，导致实现困难和测试笨重。
-- 忽略指针接收者方法导致只有 `*T` 实现接口。
-- 把接口当成泛型容器，到处使用 `interface{}`。
+不好的生产者式接口：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+type UserRepository interface {
+	Create(User) error
+	Update(User) error
+	Delete(string) error
+	Find(string) (User, error)
+	List() ([]User, error)
+}
+```
 
-### 4. 如何证明你的判断是对的？
+如果某个服务只需要查询用户，就定义最小接口：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+type UserFinder interface {
+	Find(string) (User, error)
+}
 
-- 用 `var _ Interface = (*T)(nil)` 做编译期断言。
-- 写测试用假实现替换真实依赖，检查接口是否足够小。
-- 用 `go vet` 和编译错误发现方法集不匹配。
+type ProfileService struct {
+	users UserFinder
+}
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+测试时 fake 实现也更简单：
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+type fakeUsers struct{}
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+func (fakeUsers) Find(id string) (User, error) {
+	return User{ID: id}, nil
+}
+```
 
-- 小项目不需要过早抽象接口。
-- 模块边界和测试需求增加后，小接口能显著降低耦合。
-- 大型代码库中，接口位置和大小会直接影响依赖方向和演进成本。
+接口越小，替换越容易，测试越轻。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+## 3. 值接收者和指针接收者如何影响接口实现？
 
-### 6. 初学者应该怎么把这个问题学扎实？
+值接收者方法属于 `T` 和 `*T`：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+type Namer interface {
+	Name() string
+}
+
+type User struct{ name string }
+
+func (u User) Name() string { return u.name }
+
+var _ Namer = User{}
+var _ Namer = (*User)(nil)
+```
+
+指针接收者方法只属于 `*T`：
+
+```go
+type Resetter interface {
+	Reset()
+}
+
+type Buffer struct{}
+
+func (b *Buffer) Reset() {}
+
+// var _ Resetter = Buffer{}    // 编译失败
+var _ Resetter = (*Buffer)(nil) // 正确
+```
+
+为什么？因为指针接收者方法可能要修改原对象。接口里如果存的是不可寻址的值，编译器不能保证能自动取地址。
+
+## 4. 空接口和小接口有什么区别？
+
+空接口 `any` 表示“不知道对方有什么行为”，只能保存任意值。
+
+```go
+func printAny(v any) {
+	fmt.Printf("%T %v\n", v, v)
+}
+```
+
+小接口表示“我只需要这一点行为”。
+
+```go
+type Reader interface {
+	Read([]byte) (int, error)
+}
+
+func readAll(r Reader) ([]byte, error) {
+	return io.ReadAll(r)
+}
+```
+
+`any` 会丢失编译期行为约束，后续通常需要类型断言。
+
+```go
+func length(v any) int {
+	s, ok := v.(string)
+	if !ok {
+		return 0
+	}
+	return len(s)
+}
+```
+
+所以业务抽象优先用小接口，而不是 `any`。
+
+## 5. 编译期接口断言应该写在哪里？
+
+写在具体类型所在包或相关测试文件里都可以，取决于这个约束是不是类型设计的一部分。
+
+公共扩展点建议和类型放在一起：
+
+```go
+type Plugin struct{}
+
+func (p *Plugin) Start(context.Context) error {
+	return nil
+}
+
+var _ Starter = (*Plugin)(nil)
+```
+
+如果只是测试期验证 fake 实现接口，可以放测试文件：
+
+```go
+type fakeSender struct{}
+
+func (fakeSender) Send(string) error {
+	return nil
+}
+
+var _ Sender = fakeSender{}
+```
+
+断言本身不会生成业务逻辑，它只是让编译器帮你在接口不匹配时立刻报错。

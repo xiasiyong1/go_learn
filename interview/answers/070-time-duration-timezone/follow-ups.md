@@ -1,60 +1,118 @@
 # 070. 时间 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 Go 时间格式化用 `2006-01-02`？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+Go 用一个固定参考时间表达布局：`Mon Jan 2 15:04:05 MST 2006`。你在布局里怎么写这个参考时间，输出就按相同形状生成。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+t := time.Date(2026, 7, 3, 9, 8, 7, 0, time.UTC)
 
-- `time.Time` 包含墙上时间、位置 Location，某些情况下还包含单调时间读数。
-- `time.Duration` 是纳秒为单位的整数时间段。
-- Go 的 Parse/Format 使用示例时间布局，而不是 `%Y-%m-%d` 这种占位符。
-- 用 `Sub` 比较两个由 `time.Now()` 得到的时间时，可以利用单调时钟避免系统时间调整影响。
+fmt.Println(t.Format("2006-01-02"))          // 2026-07-03
+fmt.Println(t.Format("2006-01-02 15:04:05")) // 2026-07-03 09:08:07
+fmt.Println(t.Format("15:04"))               // 09:08
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+错误示例：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+fmt.Println(t.Format("YYYY-MM-DD")) // YYYY-MM-DD
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+Go 不使用 `%Y` 这类占位符，所以这类字符串会被当成普通文本。
 
-- 系统内部存储和传输优先使用 UTC。
-- 展示给用户时再转换到用户时区。
-- 超时、间隔、重试等待使用 Duration，不用字符串或裸整数。
-- 解析外部时间时明确时区和格式，不依赖本地默认值。
+## 2. `Parse` 和 `ParseInLocation` 有什么区别？
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+`Parse` 解析不带时区的字符串时，默认得到 UTC 时间。
 
-### 3. 这道题最容易追问哪些坑？
+```go
+t, _ := time.Parse("2006-01-02 15:04:05", "2026-07-03 10:00:00")
+fmt.Println(t.Location()) // UTC
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+`ParseInLocation` 会把不带时区的字符串解释为指定地点的本地时间。
 
-- 把时间格式布局写成 `YYYY-MM-DD`，得到错误结果。
-- 数据库、JSON 和日志里混用本地时间和 UTC。
-- 用 `==` 比较 Time，忽略 Location 和单调时间差异。
-- 用裸整数表示秒、毫秒、纳秒，导致单位混乱。
+```go
+loc, _ := time.LoadLocation("Asia/Shanghai")
+t, _ := time.ParseInLocation("2006-01-02 15:04:05", "2026-07-03 10:00:00", loc)
+fmt.Println(t.Location()) // Asia/Shanghai
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+如果用户输入的是“北京时间 10 点”，就不应该用 `Parse` 默认为 UTC。
 
-### 4. 如何证明你的判断是对的？
+## 3. 为什么 `time.Time` 不建议直接用 `==` 比较？
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+`==` 会比较结构体所有字段，包括 Location 和可能存在的单调时间信息。业务上判断两个时间是否表示同一瞬间，用 `Equal`。
 
-- 写测试覆盖 UTC、本地时区和跨日边界。
-- 用 `time.ParseInLocation` 验证指定时区解析。
-- 对 JSON 和数据库读写增加时间格式兼容测试。
+```go
+utc := time.Date(2026, 7, 3, 2, 0, 0, 0, time.UTC)
+loc, _ := time.LoadLocation("Asia/Shanghai")
+sh := utc.In(loc)
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+fmt.Println(utc == sh)     // false
+fmt.Println(utc.Equal(sh)) // true
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+判断先后顺序用：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+if a.Before(b) {
+	fmt.Println("a is earlier")
+}
+```
 
-- 单机程序中时间问题通常不明显。
-- 跨时区用户、定时任务和账务系统中，时间语义必须严格。
-- 分布式系统里还要考虑时钟偏移、超时预算和日志排序。
+只有你确实想比较 Time 结构体内部所有信息时，才考虑 `==`。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+## 4. `time.Duration` 为什么不要用裸整数表示？
 
-### 6. 初学者应该怎么把这个问题学扎实？
+裸整数没有单位，读者不知道是秒、毫秒还是纳秒。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+timeout := 5 // 5 是什么单位？
+_ = timeout
+```
+
+明确写单位：
+
+```go
+timeout := 5 * time.Second
+interval := 200 * time.Millisecond
+
+_ = timeout
+_ = interval
+```
+
+函数签名也应该表达单位：
+
+```go
+func wait(d time.Duration) {
+	time.Sleep(d)
+}
+
+wait(500 * time.Millisecond)
+```
+
+这比 `func wait(ms int)` 更不容易误用。
+
+## 5. 单调时间解决什么问题，又不能解决什么问题？
+
+它解决“测量时间间隔时系统墙上时间被调整”的问题。
+
+```go
+start := time.Now()
+doWork()
+fmt.Println(time.Since(start))
+```
+
+`time.Since` 会尽量使用单调时钟读数来计算耗时。
+
+但它不能用于业务时间存储。格式化、JSON、数据库写入都会丢掉单调时钟信息。
+
+```go
+now := time.Now()
+b, _ := now.MarshalJSON()
+
+var decoded time.Time
+_ = decoded.UnmarshalJSON(b)
+```
+
+反序列化后的 `decoded` 只保留墙上时间，不保留原来的单调时钟读数。业务过期时间、创建时间、账单时间仍然应该按明确时区和时间点处理。

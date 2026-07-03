@@ -1,60 +1,254 @@
 # 002. map 并发安全 - 面试追问
 
-## 追问与参考答案
+## 1. “只读 map 是安全的”这句话有什么前提？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+前提是：所有 goroutine 都只读，并且在这些读发生期间没有任何 goroutine 写这个 `map`。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+下面这种写法是可以接受的：先构造好配置表，再只读使用。
 
-- map 底层有桶、溢出桶、哈希种子、装载因子和渐进扩容等状态，写操作可能改变这些状态。
-- 并发写或读写并发会破坏运行时对 map 内部结构的一致性假设，所以运行时会尽量检测并抛出 `fatal error: concurrent map writes`。
-- `sync.RWMutex` 保护的是临界区，不是 map 本身；锁的粒度和持锁时间决定吞吐。
-- `sync.Map` 为特定模式优化，尤其是 key 稳定、读多写少、缓存类场景，不是普通 map 的无脑替代品。
+```go
+var statusText = map[int]string{
+	200: "ok",
+	404: "not found",
+	500: "server error",
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+func Text(code int) string {
+	return statusText[code]
+}
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+但是下面这种写法不安全，因为后台 goroutine 可能更新 `routes`，前台 goroutine 同时读取：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+var routes = map[string]string{}
 
-- 读写逻辑复杂、需要维护多个字段一致性时，用普通 map 加锁更直观。
-- 缓存 key 相对稳定、读远多于写，可以评估 `sync.Map`。
-- 如果能把 map 所有权交给一个 goroutine，通过 channel 串行操作，逻辑会更容易推理。
-- 高热点 key 场景可以考虑分片锁，但要接受复杂度和遍历成本。
+func Read(path string) string {
+	return routes[path] // 没加锁的读
+}
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+func Reload(newRoutes map[string]string) {
+	for k, v := range newRoutes {
+		routes[k] = v // 没加锁的写
+	}
+}
+```
 
-### 3. 这道题最容易追问哪些坑？
+面试官问这句时，真正想看的是你能否补上“没有并发写”这个条件，而不是机械背“map 不能并发”。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. 只给写操作加锁，读操作不加锁，为什么仍然错？
 
-- 只给写操作加锁，读操作不加锁，仍然是读写并发。
-- 在锁外返回 map 内部的 slice、指针或可变对象，导致保护边界失效。
-- 误以为 `RWMutex` 一定比 `Mutex` 快，忽视写锁等待、读锁数量和临界区长度。
-- 为了消除 panic 改用 `recover`，这只是掩盖数据竞争。
+因为读和写访问的是同一个 `map` 内部结构。写入可能改变 bucket、overflow bucket、扩容状态；读操作如果没有锁，就可能在写操作进行到一半时观察到不一致的内部状态。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+错误示例：
 
-### 4. 如何证明你的判断是对的？
+```go
+type Store struct {
+	mu sync.Mutex
+	m  map[string]int
+}
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+func (s *Store) Get(key string) int {
+	return s.m[key] // 错误：读没有和写建立同步关系
+}
 
-- 用 `go test -race` 验证是否存在数据竞争。
-- 用 benchmark 对比 `Mutex`、`RWMutex`、`sync.Map` 和分片锁在目标读写比例下的表现。
-- 用锁 profiling 观察是否出现明显锁竞争，再决定是否拆锁或换模型。
+func (s *Store) Set(key string, value int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+	s.m[key] = value
+}
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+正确写法：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+type Store struct {
+	mu sync.RWMutex
+	m  map[string]int
+}
 
-- 访问量低时，普通 map 加一把锁通常足够。
-- 吞吐上来后，瓶颈可能从 map 本身转移到锁竞争、热点 key 或对象分配。
-- 分布式场景还要考虑本地 map 与远端缓存、数据库之间的一致性，而不只是进程内并发安全。
+func (s *Store) Get(key string) (int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+	v, ok := s.m[key]
+	return v, ok
+}
 
-### 6. 初学者应该怎么把这个问题学扎实？
+func (s *Store) Set(key string, value int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+	s.m[key] = value
+}
+```
+
+这里的关键不是“读锁比写锁轻”，而是所有读写都必须经过同一个同步边界。
+
+## 3. `sync.Map` 和 `map` 加 `RWMutex` 应该怎么选？
+
+可以按访问模式选。
+
+普通 `map` 加锁更适合：
+
+- 需要维护多个字段或多个 map 的一致性。
+- 需要强类型 API。
+- 有复杂遍历、统计、批量更新逻辑。
+- 写入不少，或者读写比例不确定。
+
+`sync.Map` 更适合：
+
+- 读多写少。
+- key 集合相对稳定。
+- 多 goroutine 访问不同 key。
+- 缓存、注册表、单例对象表。
+
+例如需要“扣库存同时写流水”，不能只把库存放进 `sync.Map` 就结束，因为业务一致性跨越多个状态：
+
+```go
+type Inventory struct {
+	mu     sync.Mutex
+	stock  map[string]int
+	events []string
+}
+
+func (i *Inventory) Deduct(sku string, n int) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if i.stock[sku] < n {
+		return false
+	}
+	i.stock[sku] -= n
+	i.events = append(i.events, sku)
+	return true
+}
+```
+
+这类场景用一把锁保护“库存和流水的一致性”更清楚。`sync.Map` 解决的是容器并发访问，不解决跨对象事务。
+
+## 4. `sync.Map` 里的 value 是指针时，还需要考虑什么？
+
+`sync.Map` 只保护容器的 `Load`、`Store`、`Delete` 等操作，不保护 value 指向对象内部的字段。
+
+错误示例：
+
+```go
+type User struct {
+	Name string
+}
+
+var users sync.Map // key: string, value: *User
+
+func Rename(id, name string) {
+	v, _ := users.Load(id)
+	u := v.(*User)
+	u.Name = name // 多 goroutine 同时改同一个 User 时仍然数据竞争
+}
+```
+
+可以把 value 设计成不可变对象，每次更新都替换整个指针：
+
+```go
+type User struct {
+	Name string
+}
+
+func Rename(id, name string) {
+	users.Store(id, &User{Name: name})
+}
+```
+
+如果对象字段很多、需要原地修改，就给对象内部加锁：
+
+```go
+type User struct {
+	mu   sync.Mutex
+	Name string
+}
+
+func Rename(id, name string) {
+	v, _ := users.Load(id)
+	u := v.(*User)
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.Name = name
+}
+```
+
+面试里这道追问很常见，因为很多人只记住了“`sync.Map` 并发安全”，忽略了它保护的边界。
+
+## 5. 遍历 map 时如何避免一边遍历一边修改？
+
+如果使用普通 `map` 加锁，遍历时最简单的做法是在锁内复制快照，然后在锁外做耗时处理。
+
+```go
+func (s *Store) Items() map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make(map[string]int, len(s.m))
+	for k, v := range s.m {
+		items[k] = v
+	}
+	return items
+}
+```
+
+不要在持锁期间调用外部回调，除非你能控制回调不会阻塞、不会反过来调用 `Store`、不会造成死锁。
+
+容易出问题的写法：
+
+```go
+func (s *Store) Range(fn func(string, int)) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for k, v := range s.m {
+		fn(k, v) // 回调可能很慢，也可能反过来调用 Set 导致死锁
+	}
+}
+```
+
+如果必须提供 `Range` 风格 API，可以先复制 key/value，再执行回调：
+
+```go
+func (s *Store) Range(fn func(string, int)) {
+	items := s.Items()
+	for k, v := range items {
+		fn(k, v)
+	}
+}
+```
+
+这个写法牺牲了一些内存，但锁持有时间更可控。
+
+## 6. 分片锁解决了什么问题，又引入了什么成本？
+
+分片锁解决的是单把锁竞争：不同 key 分到不同 shard，就可以并发读写不同 shard。
+
+但是它会引入这些成本：
+
+- 每次访问都要计算 shard。
+- 全量遍历需要遍历所有 shard。
+- 需要跨 shard 维护全局统计时更复杂。
+- 热点 key 如果集中在一个 shard，竞争仍然存在。
+
+例如统计总数时，必须依次拿每个 shard 的读锁：
+
+```go
+func (s *ShardedMap) Len() int {
+	total := 0
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		total += len(sh.m)
+		sh.mu.RUnlock()
+	}
+	return total
+}
+```
+
+如果面试官继续问“是不是分片越多越好”，答案是否定的。分片越多，单 shard 竞争可能下降，但内存、初始化、遍历和统计成本会上升。实际项目里要用 benchmark 和 profile 做决定。

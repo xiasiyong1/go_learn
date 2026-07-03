@@ -6,50 +6,192 @@ map 的 key 为什么必须可比较？遍历顺序为什么是随机的？
 
 ## 先给结论
 
-map key 必须可比较，因为哈希表需要稳定的哈希和相等判断；map 遍历顺序不保证稳定，是语言层面故意不让程序依赖内部布局。
+map key 必须可比较，因为哈希表需要对 key 做两件事：
 
-## 深入理解
+- 根据 key 计算哈希，定位可能的 bucket。
+- 在 bucket 内判断某个 key 是否等于目标 key。
 
-### 1. 这道题真正考察什么
+slice、map、func 没有语言定义的通用相等关系，所以不能作为 map key。
 
-- 是否知道可比较性决定能否作为 map key。
-- 是否能解释 slice、map、func 不能作为 key 的原因。
-- 是否知道 map 遍历顺序是随机化或至少不稳定的。
-- 是否能在需要稳定输出时给出排序方案。
+map 遍历顺序不保证稳定。语言故意不承诺顺序，避免程序依赖运行时内部实现。需要稳定输出时，自己排序 key。
 
-### 2. 底层机制要讲清楚
+## 什么类型能做 key
 
-- map 查找先根据 key 计算哈希定位桶，再用相等判断确认 key。
-- 不可比较类型没有语言定义的相等关系，无法作为 key。
-- map 内部会因为扩容、哈希种子、插入删除等因素改变遍历顺序。
-- Go 故意不承诺遍历顺序，避免代码依赖运行时实现细节。
-
-### 3. 工程实践怎么取舍
-
-- 需要复合 key 时，用字段都可比较的结构体。
-- 需要 slice 内容作 key 时，转换成稳定字符串、数组或自定义哈希 key。
-- 需要稳定输出时，收集 key 到 slice，排序后再访问 map。
-- 不要把 map 遍历顺序用于分页、签名、哈希或测试期望。
-
-### 4. 常见误区
-
-- 测试中直接比较 map 遍历输出字符串，导致偶发失败。
-- 结构体 key 中包含指针，比较的是地址不是指向内容。
-- 把可变对象编码后作为 key，却没有保证编码规范化。
-- 并发读写 map 时谈顺序没有意义，先解决并发安全。
-
-## 如何验证理解
-
-- 多次运行同一 map 遍历程序，观察顺序变化。
-- 为需要稳定输出的函数写测试，断言排序后的结果。
-- 用编译检查验证结构体 key 是否仍然可比较。
-
-## 代码示例
+可以：
 
 ```go
-m := map[string]int{"a": 1, "b": 2}
+map[string]int{}
+map[int64]string{}
+map[[16]byte]User{}
+```
+
+字段都可比较的结构体也可以：
+
+```go
+type UserKey struct {
+	TenantID int64
+	UserID   int64
+}
+
+visits := map[UserKey]int{}
+visits[UserKey{TenantID: 1, UserID: 2}]++
+```
+
+不可以：
+
+```go
+// map[[]byte]int{}        // slice 不可比较
+// map[map[string]int]int{} // map 不可比较
+// map[func()]int{}        // func 不可比较
+```
+
+结构体中只要有不可比较字段，就不能做 key：
+
+```go
+type BadKey struct {
+	ID   int64
+	Tags []string
+}
+
+// map[BadKey]int{} // 编译错误
+```
+
+## slice 内容想做 key 怎么办
+
+如果是 `[]byte`，可以转成 string：
+
+```go
+func Count(chunks [][]byte) map[string]int {
+	m := make(map[string]int)
+	for _, chunk := range chunks {
+		m[string(chunk)]++
+	}
+	return m
+}
+```
+
+如果长度固定，可以用数组：
+
+```go
+var id [16]byte
+copy(id[:], rawID)
+
+m := map[[16]byte]User{}
+m[id] = user
+```
+
+如果是多个字段，优先结构体 key：
+
+```go
+type CacheKey struct {
+	Method string
+	Path   string
+	Lang   string
+}
+```
+
+不要随便用字符串拼接：
+
+```go
+key := method + ":" + path + ":" + lang
+```
+
+如果字段本身可能包含分隔符，就可能冲突。要么用结构体 key，要么使用明确的编码规则。
+
+## 指针做 key 比较的是地址
+
+```go
+a := &User{ID: 1}
+b := &User{ID: 1}
+
+m := map[*User]string{}
+m[a] = "a"
+m[b] = "b"
+
+fmt.Println(len(m)) // 2
+```
+
+`a` 和 `b` 内容一样，但地址不同，所以是两个 key。
+
+如果业务语义是按 `ID` 判断同一个用户，key 应该用 ID：
+
+```go
+m := map[int64]string{}
+m[a.ID] = "a"
+m[b.ID] = "b"
+
+fmt.Println(len(m)) // 1
+```
+
+## map 遍历顺序不稳定
+
+```go
+m := map[string]int{
+	"a": 1,
+	"b": 2,
+	"c": 3,
+}
+
 for k, v := range m {
 	fmt.Println(k, v)
+}
+```
+
+不要依赖输出顺序。即使某次运行看起来固定，也不是语言保证。
+
+需要稳定输出：
+
+```go
+keys := make([]string, 0, len(m))
+for k := range m {
+	keys = append(keys, k)
+}
+sort.Strings(keys)
+
+for _, k := range keys {
+	fmt.Println(k, m[k])
+}
+```
+
+这对测试、签名、缓存 key、日志稳定输出都很重要。
+
+## 不要用 map 遍历做分页或签名
+
+错误示例：
+
+```go
+func Sign(m map[string]string) string {
+	var b strings.Builder
+	for k, v := range m {
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(v)
+		b.WriteString("&")
+	}
+	return hash(b.String())
+}
+```
+
+同一个 map 可能得到不同字符串，签名就不稳定。
+
+正确做法：
+
+```go
+func Sign(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(m[k])
+		b.WriteString("&")
+	}
+	return hash(b.String())
 }
 ```
 
@@ -57,8 +199,9 @@ for k, v := range m {
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“map key 和遍历顺序”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- map key 为什么必须可比较？
+- 结构体什么时候能做 map key？
+- `[]byte` 内容想做 key，有哪些方案？
+- 指针做 key 时比较的是地址还是内容？
+- map 遍历顺序为什么不能用于稳定输出？
+- 需要稳定 JSON、签名或测试输出时应该怎么做？

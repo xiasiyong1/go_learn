@@ -1,60 +1,144 @@
 # 073. HTTP client - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 `http.Client` 要复用？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`http.Client` 通过内部的 `Transport` 维护连接池。复用 client 才能复用 TCP/TLS 连接。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+不推荐每次请求创建：
 
-- `http.Client` 内部通过 Transport 管理连接池，应该长期复用。
-- 如果响应体不关闭，连接和 goroutine 可能无法及时释放。
-- 要复用连接，通常需要读完 body 或让 Transport 能安全回收连接。
-- 超时可以分层设置：拨号、TLS、响应头、整体请求和业务 context。
+```go
+func bad(url string) error {
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+推荐注入复用：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+type Client struct {
+	http *http.Client
+}
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+func NewClient() *Client {
+	return &Client{
+		http: &http.Client{Timeout: time.Second},
+	}
+}
+```
 
-- 创建全局或注入的复用 client，不要每次请求创建新 client。
-- 为请求设置 context deadline，并为 client/transport 设置合理超时。
-- 始终 `defer resp.Body.Close()`，并根据需要处理读取错误。
-- 高并发调用下游时配置连接池上限、空闲连接和每主机连接数。
+复用不是为了少创建一个结构体，而是为了保留连接池、减少握手和 fd 压力。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. 只调用 `resp.Body.Close()` 够不够？
 
-### 3. 这道题最容易追问哪些坑？
+关闭是必须的，但如果希望连接复用，通常还要让响应体被读到 EOF 或丢弃。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+resp, err := client.Get(url)
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
 
-- 使用默认 client 调下游，遇到慢请求无限等待。
-- 忘记关闭 body，导致连接泄漏。
-- 每次请求新建 client，失去连接复用并增加 fd 和握手成本。
-- 无脑重试 POST 请求，导致重复写入。
+_, _ = io.Copy(io.Discard, resp.Body)
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+如果响应体很大，不应该无脑读完，而要按业务限制处理：
 
-### 4. 如何证明你的判断是对的？
+```go
+limited := io.LimitReader(resp.Body, 1<<20)
+data, err := io.ReadAll(limited)
+```
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+所以回答要有边界：关闭一定要做；读完有利于连接复用；大 body 要配合大小限制和业务策略。
 
-- 用 httptest 构造慢响应、慢 header 和大 body 场景。
-- 压测时观察连接数、fd 数、超时率和 goroutine 数。
-- 用 httptrace 或日志验证连接是否复用。
+## 3. `Client.Timeout` 和 `context.WithTimeout` 有什么区别？
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+`Client.Timeout` 是这个 client 发出的请求的整体上限。
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+client := &http.Client{Timeout: 2 * time.Second}
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+context timeout 是某一次请求的调用链预算。
 
-- 低频调用只要设置超时和关闭 body 即可。
-- 高 QPS 服务中，连接池配置会直接影响延迟和下游压力。
-- 跨服务调用还要结合限流、熔断、重试退避和可观测性。
+```go
+ctx, cancel := context.WithTimeout(parent, 300*time.Millisecond)
+defer cancel()
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+resp, err := client.Do(req)
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+在服务里，下游调用应继承上游请求 context：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, downstream, nil)
+	_, _ = client.Do(req)
+}
+```
+
+这样客户端断开、请求超时、服务关闭时，下游请求能一起取消。
+
+## 4. 如何用 `httptest` 验证超时和取消？
+
+构造一个慢服务：
+
+```go
+srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(200 * time.Millisecond)
+	w.WriteHeader(http.StatusOK)
+}))
+defer srv.Close()
+
+client := &http.Client{Timeout: 50 * time.Millisecond}
+
+_, err := client.Get(srv.URL)
+fmt.Println(err != nil) // true
+```
+
+验证 context 取消：
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+cancel()
+
+req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+_, err := client.Do(req)
+fmt.Println(errors.Is(err, context.Canceled)) // 不一定直接 Is，但 err 会表示取消
+```
+
+测试重点不是错误字符串，而是请求是否按预期时间返回、服务侧是否观察到 `r.Context().Done()`。
+
+## 5. 高并发调用下游时连接池怎么配置？
+
+需要按下游容量和本服务并发配置 Transport。
+
+```go
+tr := &http.Transport{
+	MaxIdleConns:        200,
+	MaxIdleConnsPerHost: 50,
+	MaxConnsPerHost:     100,
+	IdleConnTimeout:     90 * time.Second,
+}
+
+client := &http.Client{
+	Transport: tr,
+	Timeout:   2 * time.Second,
+}
+```
+
+配置不是越大越好。太小会排队，太大会把下游打满。
+
+真实服务要结合指标看：
+
+- 当前连接数和空闲连接数。
+- 请求等待连接的时间。
+- 下游 P95/P99 延迟和错误率。
+- 本服务 goroutine 数和超时率。

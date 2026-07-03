@@ -6,50 +6,183 @@ Go 服务中的配置、环境变量和命令行参数应该怎么管理？
 
 ## 先给结论
 
-配置管理要解决的是默认值、来源优先级、类型校验、敏感信息和动态变化。Go 标准库提供 flag 和 os.Getenv，但生产服务通常需要更明确的配置结构和校验流程。
+配置管理不是简单 `os.Getenv`。一个靠谱的 Go 服务应该集中加载配置，定义强类型结构，处理默认值、来源优先级、类型转换、必填校验和敏感信息脱敏。业务代码不应该到处直接读环境变量，否则配置来源和测试都会变乱。
 
-## 深入理解
+## 1. 环境变量都是字符串
 
-### 1. 这道题真正考察什么
+```go
+port := os.Getenv("PORT")
+fmt.Printf("%T %q\n", port, port) // string
+```
 
-- 是否能区分编译期常量、启动配置和运行时动态配置。
-- 是否知道环境变量都是字符串，需要解析和校验。
-- 是否能设计默认值和优先级。
-- 是否知道敏感配置不能随意打印。
+如果配置是数字、布尔、时间段，都要解析。
 
-### 2. 底层机制要讲清楚
+```go
+raw := os.Getenv("PORT")
+port, err := strconv.Atoi(raw)
+if err != nil {
+	return fmt.Errorf("invalid PORT %q: %w", raw, err)
+}
+```
 
-- `flag` 适合命令行参数，`os.LookupEnv` 能区分未设置和设置为空字符串。
-- 配置加载通常包含读取、解析、合并、校验和注入几个阶段。
-- 强类型配置结构比到处读取环境变量更容易测试和维护。
-- 动态配置需要处理并发可见性和回滚，不只是重新读取文件。
+不要让解析失败后默默使用零值。
 
-### 3. 工程实践怎么取舍
+```go
+port, _ := strconv.Atoi(os.Getenv("PORT")) // 错：失败时 port 变 0
+```
 
-- 启动时集中加载配置，转换为强类型结构。
-- 为每个配置项定义默认值、范围和说明。
-- 敏感信息通过 secret 管理，不写入普通日志。
-- 把配置结构通过依赖注入传给模块，避免全局读取。
+`0` 可能是非法端口，也可能造成监听随机端口，问题很隐蔽。
 
-### 4. 常见误区
+## 2. 用 `LookupEnv` 区分未设置和空字符串
 
-- 代码各处直接 `os.Getenv`，导致配置来源不可追踪。
-- 未设置和设置为空字符串混淆。
-- 配置解析失败后使用零值继续启动。
-- 日志打印完整配置，泄露密码和 token。
+`os.Getenv` 不能区分“没设置”和“设置为空字符串”。
 
-## 如何验证理解
+```go
+fmt.Println(os.Getenv("NAME")) // 未设置和空字符串都返回 ""
+```
 
-- 写配置加载单元测试覆盖默认值、非法值和缺失必填项。
-- 启动时输出脱敏后的关键配置摘要。
-- 在 CI 或部署脚本中验证必填配置存在。
+用 `LookupEnv`：
+
+```go
+value, ok := os.LookupEnv("NAME")
+if !ok {
+	fmt.Println("NAME is not set")
+} else {
+	fmt.Println("NAME =", value)
+}
+```
+
+这对密码、开关、可选字段很重要。
+
+## 3. 集中加载成强类型配置
+
+推荐定义配置结构：
+
+```go
+type Config struct {
+	Addr        string
+	DatabaseDSN string
+	Timeout     time.Duration
+	Debug       bool
+}
+```
+
+集中加载：
+
+```go
+func LoadConfig() (Config, error) {
+	cfg := Config{
+		Addr:    ":8080",
+		Timeout: 3 * time.Second,
+	}
+
+	if v, ok := os.LookupEnv("ADDR"); ok {
+		cfg.Addr = v
+	}
+
+	dsn, ok := os.LookupEnv("DATABASE_DSN")
+	if !ok || dsn == "" {
+		return Config{}, fmt.Errorf("DATABASE_DSN is required")
+	}
+	cfg.DatabaseDSN = dsn
+
+	if v, ok := os.LookupEnv("TIMEOUT"); ok {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid TIMEOUT: %w", err)
+		}
+		cfg.Timeout = d
+	}
+
+	if v, ok := os.LookupEnv("DEBUG"); ok {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid DEBUG: %w", err)
+		}
+		cfg.Debug = b
+	}
+
+	return cfg, nil
+}
+```
+
+业务代码接收 `Config`，不要自己读环境变量。
+
+## 4. 命令行参数适合本地工具和启动参数
+
+```go
+addr := flag.String("addr", ":8080", "listen address")
+timeout := flag.Duration("timeout", 3*time.Second, "request timeout")
+flag.Parse()
+
+cfg := Config{
+	Addr:    *addr,
+	Timeout: *timeout,
+}
+```
+
+服务中常见优先级是：命令行参数 > 环境变量 > 配置文件 > 默认值。具体优先级不重要，重要的是团队要统一并写清楚。
+
+## 5. 敏感配置不能完整打印
+
+错误示例：
+
+```go
+log.Printf("config: %+v", cfg) // 可能打印 DATABASE_DSN、token、password
+```
+
+提供脱敏输出：
+
+```go
+func (c Config) SafeString() string {
+	return fmt.Sprintf("Config{Addr:%q Timeout:%s Debug:%v DatabaseDSN:***}",
+		c.Addr, c.Timeout, c.Debug)
+}
+
+log.Println(cfg.SafeString())
+```
+
+或者只输出非敏感摘要。
+
+## 6. 动态配置要考虑并发可见性
+
+如果配置运行时会更新，不能让多个 goroutine 随便读写同一个结构体。
+
+简单方式：用 `atomic.Value` 保存不可变快照。
+
+```go
+var current atomic.Value // stores Config
+
+current.Store(cfg)
+
+func CurrentConfig() Config {
+	return current.Load().(Config)
+}
+
+func UpdateConfig(next Config) {
+	current.Store(next)
+}
+```
+
+前提是 `Config` 当作不可变值使用，不要在取出后修改内部共享 map/slice。
+
+## 7. 面试时怎么答
+
+可以这样回答：
+
+- 环境变量都是字符串，必须解析和校验。
+- 用 `LookupEnv` 区分未设置和空字符串。
+- 启动时集中加载成强类型 Config，业务模块通过依赖注入拿配置。
+- 配置要有默认值、必填校验、范围校验和明确优先级。
+- 敏感配置不能完整打印，要脱敏。
+- 动态配置要考虑并发安全，常见做法是不可变快照加 atomic。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“配置”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- `os.Getenv` 和 `os.LookupEnv` 有什么区别？
+- 配置解析失败时为什么不能用零值继续启动？
+- 配置来源优先级应该怎么设计？
+- 敏感配置如何安全打印？
+- 动态配置如何保证并发安全？

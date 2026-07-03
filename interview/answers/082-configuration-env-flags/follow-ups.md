@@ -1,60 +1,143 @@
 # 082. 配置 - 面试追问
 
-## 追问与参考答案
+## 1. `os.Getenv` 和 `os.LookupEnv` 有什么区别？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`Getenv` 只返回字符串，未设置和设置为空字符串都会得到 `""`。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+v := os.Getenv("API_KEY")
+if v == "" {
+	fmt.Println("empty or missing")
+}
+```
 
-- `flag` 适合命令行参数，`os.LookupEnv` 能区分未设置和设置为空字符串。
-- 配置加载通常包含读取、解析、合并、校验和注入几个阶段。
-- 强类型配置结构比到处读取环境变量更容易测试和维护。
-- 动态配置需要处理并发可见性和回滚，不只是重新读取文件。
+`LookupEnv` 能区分是否设置。
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+```go
+v, ok := os.LookupEnv("API_KEY")
+if !ok {
+	return fmt.Errorf("API_KEY is required")
+}
+if v == "" {
+	return fmt.Errorf("API_KEY must not be empty")
+}
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+必填配置优先用 `LookupEnv`，否则你无法给出准确错误。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+## 2. 配置解析失败时为什么不能用零值继续启动？
 
-- 启动时集中加载配置，转换为强类型结构。
-- 为每个配置项定义默认值、范围和说明。
-- 敏感信息通过 secret 管理，不写入普通日志。
-- 把配置结构通过依赖注入传给模块，避免全局读取。
+因为零值可能是危险配置。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+timeout, _ := time.ParseDuration(os.Getenv("TIMEOUT"))
+client := &http.Client{Timeout: timeout} // 解析失败时 timeout 是 0，可能表示无超时
+```
 
-### 3. 这道题最容易追问哪些坑？
+正确做法是启动失败：
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+timeout, err := time.ParseDuration(raw)
+if err != nil {
+	return Config{}, fmt.Errorf("invalid TIMEOUT %q: %w", raw, err)
+}
+```
 
-- 代码各处直接 `os.Getenv`，导致配置来源不可追踪。
-- 未设置和设置为空字符串混淆。
-- 配置解析失败后使用零值继续启动。
-- 日志打印完整配置，泄露密码和 token。
+配置错误是部署错误，应该尽早暴露，而不是让服务带着错误配置运行。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+## 3. 配置来源优先级应该怎么设计？
 
-### 4. 如何证明你的判断是对的？
+常见优先级：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```text
+命令行参数 > 环境变量 > 配置文件 > 默认值
+```
 
-- 写配置加载单元测试覆盖默认值、非法值和缺失必填项。
-- 启动时输出脱敏后的关键配置摘要。
-- 在 CI 或部署脚本中验证必填配置存在。
+示例：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+cfg := DefaultConfig()
 
-### 5. 当规模变大后，这个问题会如何升级？
+if fileCfg, err := LoadFile(path); err == nil {
+	cfg = Merge(cfg, fileCfg)
+}
+if v, ok := os.LookupEnv("ADDR"); ok {
+	cfg.Addr = v
+}
+if *addrFlag != "" {
+	cfg.Addr = *addrFlag
+}
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+关键不是固定哪种优先级，而是：
 
-- 小命令行工具用 flag 足够。
-- 服务规模变大后，配置结构和校验会影响启动稳定性。
-- 多环境部署需要明确配置来源和优先级，避免线上环境漂移。
+- 规则统一。
+- 文档清楚。
+- 启动日志能输出脱敏后的最终结果。
+- 测试覆盖优先级冲突。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+## 4. 敏感配置如何安全打印？
 
-### 6. 初学者应该怎么把这个问题学扎实？
+不要直接 `%+v` 打印完整配置。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+log.Printf("config=%+v", cfg) // 可能泄露密码
+```
+
+给配置定义脱敏输出：
+
+```go
+type Config struct {
+	Addr string
+	DSN  string
+}
+
+func (c Config) LogFields() map[string]any {
+	return map[string]any{
+		"addr": c.Addr,
+		"dsn":  "***",
+	}
+}
+```
+
+或者只打印非敏感字段：
+
+```go
+log.Printf("addr=%s", cfg.Addr)
+```
+
+敏感信息包括 password、token、cookie、私钥、DSN 中的账号密码等。
+
+## 5. 动态配置如何保证并发安全？
+
+不要多个 goroutine 直接读写同一个可变配置结构。
+
+错误示例：
+
+```go
+var cfg Config
+
+go func() {
+	cfg.Timeout = time.Second // 写
+}()
+
+go func() {
+	fmt.Println(cfg.Timeout) // 读，数据竞争
+}()
+```
+
+用不可变快照：
+
+```go
+var current atomic.Value // Config
+
+func GetConfig() Config {
+	return current.Load().(Config)
+}
+
+func SetConfig(c Config) {
+	current.Store(c)
+}
+```
+
+如果 Config 内部有 map/slice，更新前要深拷贝，避免读者拿到后看到后续修改。

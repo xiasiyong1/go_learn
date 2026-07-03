@@ -1,60 +1,135 @@
 # 081. 排序 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么排序前有时要先复制 slice？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为排序会原地修改 slice。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+func SortedCopy(nums []int) []int {
+	out := slices.Clone(nums)
+	slices.Sort(out)
+	return out
+}
+```
 
-- 排序算法会反复调用比较函数决定元素顺序。
-- 普通排序不保证相等元素保持原相对顺序，稳定排序才保证。
-- map 的无序性来自语言不承诺遍历顺序，不能用排序函数直接作用于 map。
-- Go 新版本提供 slices、maps 等包减少样板代码。
+如果函数名叫 `SortUsers`，调用方可能接受它修改原 slice；如果函数名叫 `SortedUsers`，通常更像返回新结果。API 命名要和是否修改原数据一致。
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+错误示例：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+func Top(nums []int) int {
+	slices.Sort(nums) // 悄悄改变调用方的 nums
+	return nums[len(nums)-1]
+}
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+更稳：
 
-- 对 slice 排序前确认调用方是否允许原地修改。
-- 需要保留原顺序时先复制再排序。
-- map 输出、签名、缓存 key 和测试结果必须显式排序。
-- 比较函数中处理相等值，避免不稳定或不传递的比较逻辑。
+```go
+func Top(nums []int) int {
+	cp := slices.Clone(nums)
+	slices.Sort(cp)
+	return cp[len(cp)-1]
+}
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. `sort.Slice` 的 less 函数为什么不能写 `<=`？
 
-### 3. 这道题最容易追问哪些坑？
+less 要表达严格小于。相等时应返回 false。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+错误：
 
-- 排序函数修改了原 slice，影响调用方后续逻辑。
-- 比较函数写成 `<=`，破坏排序约定。
-- 测试依赖 map 遍历顺序。
-- 按字符串排序数字，得到 `10` 小于 `2` 的结果。
+```go
+sort.Slice(nums, func(i, j int) bool {
+	return nums[i] <= nums[j]
+})
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+当两个元素相等时，`less(i, j)` 和 `less(j, i)` 都可能为 true，排序算法的基本假设被破坏。
 
-### 4. 如何证明你的判断是对的？
+正确：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+sort.Slice(nums, func(i, j int) bool {
+	return nums[i] < nums[j]
+})
+```
 
-- 写测试覆盖空 slice、重复元素和相等字段。
-- 对 map 输出测试固定排序后的结果。
-- 用 fuzz 或随机数据检查比较函数是否稳定工作。
+`slices.SortFunc` 里，相等返回 0：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+slices.SortFunc(users, func(a, b User) int {
+	return cmp.Compare(a.Age, b.Age)
+})
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+## 3. 稳定排序解决什么问题？
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+稳定排序保证“比较相等”的元素保持原来的相对顺序。
 
-- 小数据排序成本通常可忽略。
-- 大数据排序要关注 O(n log n)、内存复制和比较函数成本。
-- 对外协议和签名场景中，稳定排序是正确性要求，不只是展示问题。
+```go
+items := []Item{
+	{Group: "a", Name: "first"},
+	{Group: "b", Name: "x"},
+	{Group: "a", Name: "second"},
+}
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+sort.SliceStable(items, func(i, j int) bool {
+	return items[i].Group < items[j].Group
+})
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+排序后两个 Group 为 `a` 的元素仍保持 `first` 在 `second` 前面。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+如果相等元素内部顺序无所谓，普通排序即可；如果 UI 展示、分页、日志输出依赖原顺序，用稳定排序。
+
+## 4. map 为什么不能直接排序？
+
+map 是哈希表，语言不保证遍历顺序。排序算法需要可索引的序列，而 map 不是序列。
+
+错误思路：
+
+```go
+// sort(m) // 不存在这种操作
+```
+
+正确做法是排序 key：
+
+```go
+keys := make([]string, 0, len(m))
+for k := range m {
+	keys = append(keys, k)
+}
+slices.Sort(keys)
+
+for _, k := range keys {
+	fmt.Println(k, m[k])
+}
+```
+
+如果 key 是结构体，要定义清楚排序字段。
+
+## 5. 排序 map 输出时有哪些性能和正确性取舍？
+
+正确性方面，签名、缓存 key、测试 golden 文件必须稳定排序。
+
+```go
+func StableString(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(m[k])
+		b.WriteByte(';')
+	}
+	return b.String()
+}
+```
+
+性能方面，排序 key 是 O(n log n)，还要额外分配 key slice。小 map 无所谓，大 map 高频输出要考虑缓存排序结果、改变数据结构，或避免在热路径生成稳定文本。

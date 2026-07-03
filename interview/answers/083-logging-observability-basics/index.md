@@ -6,50 +6,183 @@ Go 服务日志应该怎么打？结构化日志和 context 有什么关系？
 
 ## 先给结论
 
-日志不是越多越好，而是要在正确边界记录决策相关信息。结构化日志能被机器检索，context 常用于传递 trace id、request id 等请求范围元数据。
+日志不是越多越好，而是要在边界处记录能帮助定位问题的事件。生产服务优先使用结构化日志，用稳定字段表达请求、用户、资源、依赖、耗时和错误。`context` 适合携带 request id、trace id 这类请求范围元数据，但不应该被当作普通参数袋。
 
-## 深入理解
+## 1. 结构化日志比拼字符串更容易检索
 
-### 1. 这道题真正考察什么
+不推荐：
 
-- 是否能区分调试日志、业务日志、错误日志和审计日志。
-- 是否知道重复记录同一个错误会制造噪音。
-- 是否能解释结构化字段为什么比拼字符串更好。
-- 是否理解 context 只传请求范围元数据，不传 logger 全局状态。
+```go
+log.Printf("user %s create order %s failed: %v", userID, orderID, err)
+```
 
-### 2. 底层机制要讲清楚
+推荐结构化字段：
 
-- 结构化日志以 key-value 字段表达事件，便于检索、聚合和告警。
-- 请求链路中的 trace id/request id 可以从 context 中取出并写入日志。
-- 日志级别用于控制输出量和关注度，但不能替代指标。
-- 错误日志应包含操作、对象、依赖、错误和必要上下文。
+```go
+slog.ErrorContext(ctx, "create order failed",
+	"user_id", userID,
+	"order_id", orderID,
+	"err", err,
+)
+```
 
-### 3. 工程实践怎么取舍
+结构化日志的优势是机器可以按字段检索和聚合，例如查某个 `order_id` 的所有失败日志。
 
-- 在请求入口、外部依赖调用失败和关键状态变化处记录日志。
-- 错误通常在边界层统一记录，底层返回带上下文的 error。
-- 敏感字段必须脱敏或不记录。
-- 高频路径限制日志量，必要时采样。
+## 2. 错误通常在边界层记录一次
 
-### 4. 常见误区
+底层函数返回带上下文的 error：
 
-- 每层都记录同一个错误，排查时全是重复噪音。
-- 日志只写自然语言，没有结构化字段，难以查询。
-- 把密码、token、身份证等敏感信息打进日志。
-- 依赖日志做指标统计，成本高且延迟大。
+```go
+func (r Repo) LoadUser(ctx context.Context, id string) (User, error) {
+	user, err := r.db.GetUser(ctx, id)
+	if err != nil {
+		return User{}, fmt.Errorf("load user %s: %w", id, err)
+	}
+	return user, nil
+}
+```
 
-## 如何验证理解
+HTTP 边界统一记录：
 
-- 用测试或审查确认关键错误路径有日志且字段完整。
-- 检查日志样例能否按 trace id、用户、资源 ID 检索。
-- 做脱敏测试，防止敏感字段输出。
+```go
+func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	user, err := h.repo.LoadUser(r.Context(), r.URL.Query().Get("id"))
+	if err != nil {
+		slog.ErrorContext(r.Context(), "request failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(user)
+}
+```
+
+不要每层都打同一个错误，否则日志里会出现多条重复噪音。
+
+## 3. context 适合传请求范围元数据
+
+定义私有 key，避免冲突：
+
+```go
+type contextKey string
+
+const requestIDKey contextKey = "request_id"
+
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDKey, id)
+}
+
+func RequestID(ctx context.Context) string {
+	v, _ := ctx.Value(requestIDKey).(string)
+	return v
+}
+```
+
+写日志时取出来：
+
+```go
+slog.InfoContext(ctx, "request started",
+	"request_id", RequestID(ctx),
+	"path", path,
+)
+```
+
+不要把业务参数、数据库连接、logger 全部塞进 context。context value 适合跨 API 边界传请求元数据。
+
+## 4. 日志级别要表达关注度
+
+```go
+slog.Debug("cache miss", "key", key)
+slog.Info("server started", "addr", addr)
+slog.Warn("downstream slow", "service", "payment", "cost", cost)
+slog.Error("downstream failed", "service", "payment", "err", err)
+```
+
+常见判断：
+
+- Debug：开发或临时排查。
+- Info：关键生命周期和业务事件。
+- Warn：可恢复但需要关注。
+- Error：请求或任务失败。
+
+日志级别不是指标系统。QPS、错误率、延迟应该进 metrics。
+
+## 5. 敏感字段必须脱敏
+
+错误示例：
+
+```go
+slog.Info("login", "password", password, "token", token)
+```
+
+正确做法：
+
+```go
+slog.Info("login",
+	"user_id", userID,
+	"token", "***",
+)
+```
+
+对结构体输出也要小心：
+
+```go
+type User struct {
+	ID       string
+	Password string
+}
+
+slog.Info("user", "user", user) // 可能泄露 Password
+```
+
+更稳的是只输出必要字段。
+
+## 6. 高频日志要采样或降级
+
+循环里打错误日志可能把日志系统打爆。
+
+```go
+for _, item := range items {
+	if err := process(item); err != nil {
+		slog.Error("process item failed", "err", err) // 高频时很危险
+	}
+}
+```
+
+可以聚合后记录摘要：
+
+```go
+failed := 0
+for _, item := range items {
+	if err := process(item); err != nil {
+		failed++
+	}
+}
+
+if failed > 0 {
+	slog.Warn("batch finished with failures", "failed", failed, "total", len(items))
+}
+```
+
+需要逐条排查时再加采样或 debug 级别。
+
+## 7. 面试时怎么答
+
+可以这样回答：
+
+- 日志要记录事件和上下文，不是到处 print。
+- 生产服务优先结构化日志，字段要稳定可检索。
+- 底层返回带上下文的 error，边界层统一记录，避免重复日志。
+- context 可传 request id、trace id 等请求元数据。
+- 敏感字段必须脱敏。
+- 高频路径要控制日志量，指标和 trace 不能用日志替代。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“日志”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- 为什么不要每一层都打印同一个 error？
+- 结构化日志字段应该怎么选？
+- request id 应该怎么进入日志？
+- 日志、指标、trace 分别解决什么问题？
+- 如何避免日志泄露敏感信息？

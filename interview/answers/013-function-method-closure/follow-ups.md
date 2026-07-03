@@ -1,60 +1,218 @@
 # 013. 函数、方法、闭包和可变参数 - 面试追问
 
-## 追问与参考答案
+## 1. 函数值可以做什么？nil 函数调用会怎样？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+函数可以像普通值一样赋值、传参、返回。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+func Apply(n int, f func(int) int) int {
+	return f(n)
+}
 
-- 方法接收者只是普通参数的一种语法形式，方法集决定类型是否实现接口。
-- 方法值会绑定接收者，方法表达式需要显式传入接收者。
-- 闭包让变量生命周期可能延长，捕获变量可能逃逸到堆上。
-- 可变参数调用时，已有切片需要使用 `s...` 展开。
+double := func(n int) int {
+	return n * 2
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+fmt.Println(Apply(3, double)) // 6
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+函数类型的零值是 `nil`。调用 nil 函数会 panic。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+var f func()
 
-- 回调和策略函数适合用函数值表达。
-- 需要围绕类型组织行为、实现接口时使用方法。
-- 闭包适合封装少量上下文，但捕获变量要清晰，尤其在循环和并发中。
-- 可变参数适合少量同类可选项，大量配置更适合 option struct 或 functional options。
+fmt.Println(f == nil) // true
+f() // panic
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+所以回调参数如果允许为空，要先判断：
 
-### 3. 这道题最容易追问哪些坑？
+```go
+func Run(after func()) {
+	// do work
+	if after != nil {
+		after()
+	}
+}
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. 方法值和方法表达式有什么区别？
 
-- 循环里闭包捕获循环变量，所有 goroutine 看到同一个变化中的变量。
-- 方法值绑定了接收者副本，值接收者和指针接收者效果不同。
-- 可变参数传入切片时忘记 `...`。
-- 闭包长期持有大对象，导致内存不能释放。
+方法值会绑定接收者：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+type User struct {
+	Name string
+}
 
-### 4. 如何证明你的判断是对的？
+func (u User) Hello(prefix string) string {
+	return prefix + u.Name
+}
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+u := User{Name: "Tom"}
+hello := u.Hello
 
-- 用表格测试验证方法值和方法表达式的调用差异。
-- 用 `go build -gcflags=-m` 看闭包捕获是否导致逃逸。
-- 在并发循环中为每次迭代创建局部副本，并用 race detector 验证。
+fmt.Println(hello("hi ")) // hi Tom
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+方法表达式不绑定接收者，调用时要显式传：
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+hello := User.Hello
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+u := User{Name: "Tom"}
+fmt.Println(hello(u, "hi ")) // hi Tom
+```
 
-- 小函数里闭包能提升局部性。
-- 复杂并发系统中，闭包捕获状态过多会降低可读性和可测试性。
-- 公共 API 的可变参数要谨慎设计，避免后续扩展困难。
+区别可以记成：
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+- 方法值：`u.Hello`，接收者已经定了。
+- 方法表达式：`User.Hello`，接收者还是参数。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+## 3. 值接收者的方法值为什么可能看到旧数据？
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+因为值接收者会复制接收者。
+
+```go
+type Counter struct {
+	N int
+}
+
+func (c Counter) Value() int {
+	return c.N
+}
+
+c := Counter{N: 1}
+value := c.Value
+
+c.N = 2
+
+fmt.Println(value())   // 1
+fmt.Println(c.Value()) // 2
+```
+
+`value := c.Value` 时，方法值里保存了一份当时的 `Counter` 副本。
+
+如果改成指针接收者，方法值绑定的是指针：
+
+```go
+func (c *Counter) PtrValue() int {
+	return c.N
+}
+
+c := Counter{N: 1}
+value := c.PtrValue
+c.N = 2
+
+fmt.Println(value()) // 2
+```
+
+这不是谁优谁劣，而是语义不同：值接收者强调复制，指针接收者强调共享和可变。
+
+## 4. 闭包捕获变量会带来什么生命周期和并发问题？
+
+闭包捕获的是变量。只要闭包还活着，被捕获变量就可能继续活着。
+
+```go
+func Accumulator() func(int) int {
+	sum := 0
+	return func(n int) int {
+		sum += n
+		return sum
+	}
+}
+```
+
+`Accumulator` 返回后，`sum` 仍然被返回的函数使用。
+
+并发场景下，捕获的变量如果被多个 goroutine 修改，需要同步：
+
+```go
+count := 0
+
+for i := 0; i < 10; i++ {
+	go func() {
+		count++ // 数据竞争
+	}()
+}
+```
+
+正确方向是加锁、用 channel 汇总，或者用 atomic。不要因为闭包写起来方便就忽略共享状态。
+
+## 5. 循环里启动 goroutine 时，为什么建议显式传参或重新绑定变量？
+
+这样每次迭代的值边界更清楚，也减少版本语义和读者理解成本。
+
+推荐：
+
+```go
+for _, item := range items {
+	item := item
+	go func() {
+		process(item)
+	}()
+}
+```
+
+或者：
+
+```go
+for _, item := range items {
+	go func(v Item) {
+		process(v)
+	}(item)
+}
+```
+
+不要写成捕获外部可变状态：
+
+```go
+var current Item
+for _, item := range items {
+	current = item
+	go func() {
+		process(current)
+	}()
+}
+```
+
+这里所有 goroutine 共享同一个 `current`，既可能逻辑错，也可能产生数据竞争。
+
+## 6. 可变参数和切片之间是什么关系？
+
+可变参数在函数内部就是切片。
+
+```go
+func PrintAll(args ...string) {
+	fmt.Printf("%T %v\n", args, args) // []string
+}
+```
+
+调用时可以传多个参数：
+
+```go
+PrintAll("a", "b")
+```
+
+已有切片要用 `...` 展开：
+
+```go
+xs := []string{"a", "b"}
+PrintAll(xs...)
+```
+
+如果函数修改参数元素，传入切片的调用方会看到变化：
+
+```go
+func Clear(nums ...int) {
+	for i := range nums {
+		nums[i] = 0
+	}
+}
+
+xs := []int{1, 2, 3}
+Clear(xs...)
+fmt.Println(xs) // [0 0 0]
+```
+
+所以设计可变参数 API 时，最好默认只读；如果会修改，要在文档和命名里说清楚。

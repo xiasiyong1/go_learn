@@ -6,50 +6,189 @@ fan-in、fan-out 和背压在 Go 并发里应该怎么设计？
 
 ## 先给结论
 
-fan-out 把任务分发给多个 worker，fan-in 把多个结果汇聚回来。真正困难的是背压：当下游慢、上游快或某个阶段失败时，系统不能无限堆积，也不能泄漏 goroutine。
+fan-out 是把任务分发给多个 worker 并行处理，fan-in 是把多个来源的结果汇聚到一个出口。真正需要讲深的是背压：当生产快、消费慢、下游失败或消费者提前退出时，代码不能无限堆积，也不能把 goroutine 卡死在发送或接收上。
 
-## 深入理解
+## 1. fan-out：多个 worker 消费同一个任务源
 
-### 1. 这道题真正考察什么
+```go
+func worker(ctx context.Context, jobs <-chan Job, results chan<- Result) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case job, ok := <-jobs:
+			if !ok {
+				return nil
+			}
+			result := handle(job)
+			select {
+			case results <- result:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+```
 
-- 是否能区分 fan-out 和 worker pool。
-- 是否能设计多个输入的安全汇聚。
-- 是否知道下游提前退出会阻塞上游发送。
-- 是否能解释背压和缓冲区大小的关系。
+关键点：
 
-### 2. 底层机制要讲清楚
+- worker 从同一个 `jobs` channel 取任务。
+- `jobs` 应该由生产者关闭。
+- 发送结果时也要监听 `ctx.Done()`，否则消费者退出后 worker 可能卡住。
 
-- fan-out 通过多个 worker 从同一个任务源取数据。
-- fan-in 通过中间 goroutine 或同步机制把多个输出合并到一个 channel。
-- 无缓冲或小缓冲 channel 会把下游速度反馈给上游。
-- 缓冲区能吸收突发，但长期无法解决处理能力不足。
+## 2. fan-in：多个输入合并成一个输出
 
-### 3. 工程实践怎么取舍
+合并多个 channel 时，不能提前关闭输出 channel。必须等所有转发 goroutine 结束。
 
-- 每个阶段都接收 context，发送和接收时都能退出。
-- 合并多个 channel 时用 WaitGroup 确认所有发送者结束后再关闭输出。
-- 根据下游容量设置 worker 数和队列长度。
-- 当消费者只需要部分结果时，要取消剩余生产者。
+```go
+func merge[T any](ctx context.Context, inputs ...<-chan T) <-chan T {
+	out := make(chan T)
+	var wg sync.WaitGroup
 
-### 4. 常见误区
+	for _, in := range inputs {
+		in := in
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for v := range in {
+				select {
+				case out <- v:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
-- fan-in 输出 channel 被提前关闭，仍有发送者写入导致 panic。
-- 消费者提前返回，上游 goroutine 永久阻塞在发送。
-- 缓冲区过大导致内存堆积和尾延迟升高。
-- worker 数只按 CPU 设置，忽略下游接口限额。
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
 
-## 如何验证理解
+	return out
+}
+```
 
-- 写测试覆盖消费者提前退出和 context 取消。
-- 用压测观察不同 worker 数和缓冲大小下的吞吐与延迟。
-- 用 goroutine profile 检查阻塞在 send/receive 的位置。
+这里关闭 `out` 的只能是协调者，不能让任意一个输入结束时就关闭 `out`。
+
+## 3. 背压是什么
+
+背压就是让下游处理能力反向影响上游生产速度。无缓冲或小缓冲 channel 天然会形成背压。
+
+```go
+jobs := make(chan Job) // 无缓冲
+
+go producer(jobs)
+go consumer(jobs)
+```
+
+如果 consumer 慢，producer 发送会阻塞。
+
+有缓冲 channel 可以吸收突发：
+
+```go
+jobs := make(chan Job, 100)
+```
+
+但缓冲不是吞吐能力。消费者长期慢，缓冲迟早会满。缓冲过大还会增加内存和尾延迟。
+
+## 4. 消费者提前退出时必须取消上游
+
+错误示例：只取第一个结果后返回。
+
+```go
+func first(results <-chan Result) Result {
+	return <-results
+}
+```
+
+如果上游还在继续发送，可能永远阻塞。
+
+更好的写法是带 context：
+
+```go
+func first(ctx context.Context, cancel context.CancelFunc, results <-chan Result) (Result, error) {
+	defer cancel()
+
+	select {
+	case r := <-results:
+		return r, nil
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	}
+}
+```
+
+所有上游发送点都要监听 `ctx.Done()`，取消才有意义。
+
+## 5. worker 数不是越多越好
+
+CPU 密集任务通常接近 `GOMAXPROCS`。I/O 密集任务可能更多，但还要受下游连接池、QPS、数据库连接数限制。
+
+```go
+workerN := 10
+for i := 0; i < workerN; i++ {
+	go worker(ctx, jobs, results)
+}
+```
+
+如果下游数据库只有 20 个连接，开 1000 个 worker 只会制造排队、超时和更高内存。
+
+## 6. 完整的关闭顺序
+
+典型顺序：
+
+```go
+jobs := make(chan Job)
+results := make(chan Result)
+
+// 生产者负责关闭 jobs
+go func() {
+	defer close(jobs)
+	for _, job := range allJobs {
+		select {
+		case jobs <- job:
+		case <-ctx.Done():
+			return
+		}
+	}
+}()
+
+// worker 结束后，由协调者关闭 results
+var wg sync.WaitGroup
+for i := 0; i < workerN; i++ {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		worker(ctx, jobs, results)
+	}()
+}
+
+go func() {
+	wg.Wait()
+	close(results)
+}()
+```
+
+原则：谁发送，谁关闭；多个发送者时，由协调者等所有发送者结束后关闭。
+
+## 7. 面试时怎么答
+
+可以这样回答：
+
+- fan-out 是多个 worker 从同一个任务源消费。
+- fan-in 是把多个输入合并到一个输出，输出 channel 只能在所有发送者结束后关闭。
+- 背压是下游慢时让上游阻塞或降速，channel 缓冲只能吸收突发，不能解决长期处理能力不足。
+- 所有发送和接收点都要考虑 context 取消，防止消费者提前退出导致 goroutine 泄漏。
+- worker 数要根据 CPU、I/O、下游容量和延迟目标决定。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“并发模式”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- fan-out 和 worker pool 是一回事吗？
+- fan-in 的输出 channel 应该由谁关闭？
+- 消费者只要第一个结果时，如何避免上游泄漏？
+- channel 缓冲区越大越好吗？
+- 如何判断 worker 数量设置得是否合理？

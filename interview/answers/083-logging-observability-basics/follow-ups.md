@@ -1,60 +1,136 @@
 # 083. 日志 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么不要每一层都打印同一个 error？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为会制造重复噪音，让排查者以为发生了多次错误。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+不推荐：
 
-- 结构化日志以 key-value 字段表达事件，便于检索、聚合和告警。
-- 请求链路中的 trace id/request id 可以从 context 中取出并写入日志。
-- 日志级别用于控制输出量和关注度，但不能替代指标。
-- 错误日志应包含操作、对象、依赖、错误和必要上下文。
+```go
+func repo() error {
+	err := errors.New("db failed")
+	slog.Error("repo failed", "err", err)
+	return err
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+func service() error {
+	if err := repo(); err != nil {
+		slog.Error("service failed", "err", err)
+		return err
+	}
+	return nil
+}
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+更好的方式：底层加上下文，边界层记录。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+func repo() error {
+	if err := query(); err != nil {
+		return fmt.Errorf("query user: %w", err)
+	}
+	return nil
+}
 
-- 在请求入口、外部依赖调用失败和关键状态变化处记录日志。
-- 错误通常在边界层统一记录，底层返回带上下文的 error。
-- 敏感字段必须脱敏或不记录。
-- 高频路径限制日志量，必要时采样。
+func handler(w http.ResponseWriter, r *http.Request) {
+	if err := repo(); err != nil {
+		slog.ErrorContext(r.Context(), "request failed", "err", err)
+	}
+}
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. 结构化日志字段应该怎么选？
 
-### 3. 这道题最容易追问哪些坑？
+选择能帮助检索和定位的字段。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+slog.ErrorContext(ctx, "payment request failed",
+	"request_id", requestID,
+	"user_id", userID,
+	"order_id", orderID,
+	"provider", "stripe",
+	"cost_ms", cost.Milliseconds(),
+	"err", err,
+)
+```
 
-- 每层都记录同一个错误，排查时全是重复噪音。
-- 日志只写自然语言，没有结构化字段，难以查询。
-- 把密码、token、身份证等敏感信息打进日志。
-- 依赖日志做指标统计，成本高且延迟大。
+字段命名要稳定。不要今天叫 `userID`，明天叫 `uid`，后天叫 `user_id`。字段稳定性会直接影响日志查询和告警规则。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+## 3. request id 应该怎么进入日志？
 
-### 4. 如何证明你的判断是对的？
+入口 middleware 生成或读取 request id，放入 context，后续日志从 context 取。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = newRequestID()
+		}
+		ctx := WithRequestID(r.Context(), id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+```
 
-- 用测试或审查确认关键错误路径有日志且字段完整。
-- 检查日志样例能否按 trace id、用户、资源 ID 检索。
-- 做脱敏测试，防止敏感字段输出。
+日志：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+slog.InfoContext(ctx, "load user",
+	"request_id", RequestID(ctx),
+	"user_id", userID,
+)
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+真实项目也可能由 OpenTelemetry trace id 统一串联，但思路一样：入口注入，链路传递，日志输出。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 4. 日志、指标、trace 分别解决什么问题？
 
-- 小程序 fmt 打印可临时调试。
-- 生产服务需要结构化日志、指标和 trace 协同。
-- 日志量很大时，采样、级别和字段规范会直接影响成本和可排查性。
+日志回答“发生了什么具体事件”。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+slog.Error("db query failed", "sql", "select user", "err", err)
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+指标回答“整体趋势怎么样”。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```text
+http_requests_total
+http_request_duration_seconds
+db_errors_total
+```
+
+trace 回答“一次请求经过哪些步骤、每步耗时多少”。
+
+面试里可以这样说：日志用于细节，指标用于告警和趋势，trace 用于链路和耗时。不要用日志硬算 QPS，也不要指望指标告诉你某个订单为什么失败。
+
+## 5. 如何避免日志泄露敏感信息？
+
+第一，不记录敏感字段。
+
+```go
+slog.Info("user login", "user_id", userID)
+```
+
+第二，必须记录时脱敏。
+
+```go
+func maskToken(token string) string {
+	if len(token) <= 6 {
+		return "***"
+	}
+	return token[:3] + "***" + token[len(token)-3:]
+}
+```
+
+第三，不直接打印完整结构体。
+
+```go
+// 不推荐
+slog.Info("request", "body", req)
+
+// 推荐
+slog.Info("request", "user_id", req.UserID, "action", req.Action)
+```
+
+敏感信息包括密码、token、cookie、身份证、手机号、邮箱、银行卡、私钥、DSN 等。公共日志规范里应该明确这些字段。

@@ -6,50 +6,198 @@ Go build tags 和按平台条件编译应该怎么用？
 
 ## 先给结论
 
-build tags 用于控制某些文件是否参与构建，常见于平台差异、可选功能、集成测试和工具代码。它很有用，但也容易让代码路径在不同构建条件下分裂。
+build tag 是文件级别的构建约束，用来决定某个 `.go` 文件是否参与本次构建。它常用于平台差异、可选功能、集成测试、工具代码。好处是边界清楚，坏处是会制造多条构建路径；每条路径都要能编译、能测试。
 
-## 深入理解
+## 1. `//go:build` 写在文件开头
 
-### 1. 这道题真正考察什么
+示例：只有指定 `integration` tag 时才编译这个测试文件。
 
-- 是否知道 `//go:build` 必须放在文件开头附近。
-- 是否能解释文件名后缀如 `_linux.go`、`_test.go` 的作用。
-- 是否知道 build tags 影响的是文件级编译。
-- 是否能说明条件编译和运行时判断的取舍。
+```go
+//go:build integration
 
-### 2. 底层机制要讲清楚
+package user_test
 
-- Go 工具链根据 build constraints 决定某个文件是否进入当前包构建。
-- 平台后缀如 `_windows.go`、`_amd64.go` 是内置条件。
-- `_test.go` 文件只在测试构建中参与。
-- 自定义 tag 需要通过 `go build -tags` 或 `go test -tags` 指定。
+import "testing"
 
-### 3. 工程实践怎么取舍
+func TestWithRealDB(t *testing.T) {
+	// connect real db
+}
+```
 
-- 平台系统调用差异适合用平台文件拆分。
-- 集成测试、慢测试、依赖外部服务的测试可以用 tag 隔离。
-- 同一组条件编译文件应提供一致 API，调用方不需要关心平台差异。
-- 保持 tag 数量少，并在 README 或测试命令里说明。
+运行：
 
-### 4. 常见误区
+```bash
+go test -tags integration ./...
+```
 
-- 某些 tag 下缺少实现，平时构建通过，发布构建失败。
-- build tag 注释位置不对，约束没有生效。
-- 条件编译分支太多，测试覆盖不到所有组合。
-- 用 build tag 隐藏业务逻辑差异，导致行为难以排查。
+不带 tag 时，这个文件不会进入构建。
 
-## 如何验证理解
+`//go:build` 必须在文件开头附近，通常放第一行，后面空一行再写 `package`。
 
-- 用 `go test ./...` 和关键 `go test -tags ... ./...` 都跑一遍。
-- 在 CI 中覆盖目标 GOOS/GOARCH 或 tag 组合。
-- 用 `go list` 检查特定条件下参与构建的文件。
+## 2. 平台后缀也是构建约束
+
+文件名可以表达平台。
+
+```text
+path_unix.go
+path_windows.go
+```
+
+也可以更具体：
+
+```text
+syscall_linux_amd64.go
+syscall_darwin_arm64.go
+```
+
+Go 工具链会根据 `GOOS`、`GOARCH` 自动选择。
+
+```bash
+GOOS=linux GOARCH=amd64 go test ./...
+GOOS=windows GOARCH=amd64 go test ./...
+```
+
+平台文件应提供同一组函数，让调用方不关心平台差异。
+
+```go
+// path_unix.go
+package pathx
+
+func defaultConfigPath() string {
+	return "/etc/app/config.yaml"
+}
+```
+
+```go
+// path_windows.go
+package pathx
+
+func defaultConfigPath() string {
+	return `C:\ProgramData\App\config.yaml`
+}
+```
+
+## 3. tag 是文件级别，不是语句级别
+
+build tag 决定整个文件是否参与构建，不能只控制某个函数或某几行。
+
+如果你需要同一个函数在不同 tag 下有不同实现，就拆文件。
+
+```text
+feature_enabled.go
+feature_disabled.go
+```
+
+```go
+//go:build feature
+
+package feature
+
+func Enabled() bool { return true }
+```
+
+```go
+//go:build !feature
+
+package feature
+
+func Enabled() bool { return false }
+```
+
+两个文件提供相同 API，调用方不用写条件判断。
+
+## 4. `_test.go` 只参与测试构建
+
+`xxx_test.go` 文件不会进入普通 `go build`，只在 `go test` 时参与。
+
+```go
+// user_test.go
+package user
+
+func TestCreate(t *testing.T) {}
+```
+
+集成测试可以组合 `_test.go` 和 build tag。
+
+```go
+//go:build integration
+
+package user
+
+func TestRealDatabase(t *testing.T) {}
+```
+
+这样普通单测不会依赖真实数据库。
+
+## 5. 常见坑：某个 tag 下缺实现
+
+例如有调用方依赖：
+
+```go
+func Run() {
+	startWorker()
+}
+```
+
+但 `startWorker` 只在某个 tag 文件里定义：
+
+```go
+//go:build worker
+
+package app
+
+func startWorker() {}
+```
+
+不带 `worker` tag 构建时就会失败。每组条件编译文件必须保证所有目标构建条件下 API 完整。
+
+## 6. 如何验证
+
+常规测试：
+
+```bash
+go test ./...
+```
+
+关键 tag 测试：
+
+```bash
+go test -tags integration ./...
+go test -tags feature ./...
+```
+
+平台构建：
+
+```bash
+GOOS=linux GOARCH=amd64 go test ./...
+GOOS=darwin GOARCH=arm64 go test ./...
+```
+
+检查某个文件是否参与构建，可以用：
+
+```bash
+go list -json .
+```
+
+查看 `GoFiles`、`IgnoredGoFiles`。
+
+## 7. 面试时怎么答
+
+可以这样回答：
+
+- build tag 是文件级构建约束，控制某个文件是否参与构建。
+- `//go:build` 放在文件开头，`go build -tags` 或 `go test -tags` 启用自定义 tag。
+- `_linux.go`、`_windows.go`、`_amd64.go` 是平台约束。
+- `_test.go` 只参与测试构建。
+- 条件编译文件应提供一致 API，避免某些 tag 下缺实现。
+- tag 组合要在 CI 中测试，否则很容易只在发布时才发现失败。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“构建”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- `//go:build` 应该放在哪里？
+- build tag 和文件名平台后缀有什么关系？
+- 如何为不同平台提供同一个函数的不同实现？
+- 为什么 tag 过多会增加维护成本？
+- 如何确认某个 tag 下代码真的会编译？

@@ -1,60 +1,159 @@
 # 074. database/sql - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 `sql.DB` 不是一个连接？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`sql.DB` 是连接池管理器。它内部按需打开、复用、关闭多个底层连接。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+db, err := sql.Open("mysql", dsn)
+if err != nil {
+	return err
+}
 
-- `sql.DB` 管理空闲和活跃连接，内部会按需建立连接。
-- `Rows` 持有连接资源，不关闭会影响连接池可用连接数。
-- 事务 `Tx` 绑定到单个连接，必须 Commit 或 Rollback 结束。
-- 连接池参数包括最大打开连接、最大空闲连接、连接生命周期和空闲时间。
+// sql.Open 通常不立即验证数据库可用
+if err := db.PingContext(ctx); err != nil {
+	return err
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+所以它应该作为长生命周期对象复用：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+type Repo struct {
+	db *sql.DB
+}
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+func NewRepo(db *sql.DB) *Repo {
+	return &Repo{db: db}
+}
+```
 
-- 应用启动时创建 DB，退出时关闭。
-- 每次 Query 后 `defer rows.Close()`，并在遍历后检查 `rows.Err()`。
-- 事务中使用 `defer tx.Rollback()` 兜底，成功后 Commit。
-- 根据数据库容量和服务并发配置连接池，不要无限打开连接。
+每个请求都 `Open`/`Close` 会破坏连接复用，也可能造成连接风暴。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. `Rows` 不关闭会造成什么问题？
 
-### 3. 这道题最容易追问哪些坑？
+`Rows` 持有数据库连接资源。不关闭时，连接可能迟迟不能回到连接池。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+错误写法：
 
-- 每个请求 Open 一次 DB，导致连接风暴。
-- Rows 未关闭，连接池耗尽。
-- 事务失败路径忘记 Rollback，连接长期占用。
-- 连接池上限过大，把数据库打满。
+```go
+rows, err := db.QueryContext(ctx, "select id from users")
+if err != nil {
+	return err
+}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+for rows.Next() {
+	// ...
+}
+// 忘记 rows.Close()
+```
 
-### 4. 如何证明你的判断是对的？
+正确写法：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+rows, err := db.QueryContext(ctx, "select id from users")
+if err != nil {
+	return err
+}
+defer rows.Close()
 
-- 用集成测试覆盖查询、空结果、事务失败和提交失败。
-- 监控 `DB.Stats()` 中 open、in-use、idle、wait count。
-- 压测不同连接池配置，观察数据库延迟和等待时间。
+for rows.Next() {
+	var id int64
+	if err := rows.Scan(&id); err != nil {
+		return err
+	}
+}
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+if err := rows.Err(); err != nil {
+	return err
+}
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+连接池耗尽时，表面现象可能是请求变慢、goroutine 堆积、`DB.Stats().WaitCount` 增长。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 3. `QueryRow` 为什么要在 `Scan` 时处理错误？
 
-- 小服务默认连接池可能暂时够用。
-- 流量上来后，连接池是保护数据库的关键背压点。
-- 复杂业务要把事务范围缩小，避免持事务做远程调用或慢计算。
+`QueryRowContext` 返回的是 `*Row`，它没有单独的 error 返回值。查询错误、空结果、扫描错误都会在 `Scan` 暴露。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+var name string
+err := db.QueryRowContext(ctx, "select name from users where id = ?", id).Scan(&name)
+switch {
+case errors.Is(err, sql.ErrNoRows):
+	return "", nil
+case err != nil:
+	return "", err
+default:
+	return name, nil
+}
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+如果你忘记 `Scan`，查询根本没有被完整消费，错误也不会被处理。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+## 4. 事务中 `defer tx.Rollback()` 会不会影响 Commit？
+
+常见写法是：
+
+```go
+tx, err := db.BeginTx(ctx, nil)
+if err != nil {
+	return err
+}
+defer tx.Rollback()
+
+// 执行 SQL...
+
+return tx.Commit()
+```
+
+如果 `Commit` 成功，defer 中的 `Rollback` 会在已提交事务上执行，通常返回 `sql.ErrTxDone`，可以忽略。它的价值是兜底失败路径。
+
+如果你想更显式，也可以这样写：
+
+```go
+committed := false
+defer func() {
+	if !committed {
+		_ = tx.Rollback()
+	}
+}()
+
+if err := tx.Commit(); err != nil {
+	return err
+}
+committed = true
+return nil
+```
+
+多数场景第一种更简洁，团队风格统一即可。
+
+## 5. 连接池参数应该怎么调？
+
+先理解参数，再用指标调。
+
+```go
+db.SetMaxOpenConns(50)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(30 * time.Minute)
+db.SetConnMaxIdleTime(5 * time.Minute)
+```
+
+观测连接池：
+
+```go
+stats := db.Stats()
+fmt.Printf("open=%d inuse=%d idle=%d wait=%d waitDur=%s\n",
+	stats.OpenConnections,
+	stats.InUse,
+	stats.Idle,
+	stats.WaitCount,
+	stats.WaitDuration,
+)
+```
+
+经验判断：
+
+- `WaitCount` 和 `WaitDuration` 持续增长，说明应用侧在等连接。
+- `MaxOpenConns` 太大，可能把数据库连接打满。
+- `MaxIdleConns` 太小，高峰时会频繁建连。
+- 调整前要看数据库 CPU、连接数、慢查询和应用延迟，不能只看 Go 侧。

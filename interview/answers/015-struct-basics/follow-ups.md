@@ -1,60 +1,205 @@
 # 015. 结构体基础 - 面试追问
 
-## 追问与参考答案
+## 1. 结构体赋值是深拷贝还是浅拷贝？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+是字段级别的值拷贝，也就是浅拷贝。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type Profile struct {
+	Name string
+	Tags []string
+}
 
-- 结构体值拷贝是浅拷贝：字段本身会复制，但字段指向的数据可能仍共享。
-- 匿名字段会提升字段和方法，但不会建立父子类型关系。
-- 结构体 tag 编译器不理解其业务含义，JSON、ORM、校验器等库通过反射读取。
-- 所有字段都可比较时，结构体才可比较；含 slice、map、func 时不可比较。
+a := Profile{Name: "Tom", Tags: []string{"go"}}
+b := a
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+b.Name = "Jerry"
+b.Tags[0] = "java"
 
-### 2. 这个知识点在真实项目里怎么取舍？
+fmt.Println(a.Name)    // Tom
+fmt.Println(a.Tags[0]) // java
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+`Name` 是字符串字段，赋值后 `a.Name` 不受 `b.Name` 影响。`Tags` 是 slice 字段，拷贝的是 slice 描述符，底层数组仍然共享。
 
-- 小而不可变的数据结构适合值语义。
-- 含锁、缓存、连接、上下文等状态的结构体一般不应随意复制。
-- tag 用于边界层映射，不要让领域模型被过多框架 tag 污染。
-- 组合可以复用行为，但对外暴露匿名字段要注意 API 泄露。
+要深拷贝就手动复制引用字段：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+func CloneProfile(p Profile) Profile {
+	tags := append([]string(nil), p.Tags...)
+	return Profile{Name: p.Name, Tags: tags}
+}
+```
 
-### 3. 这道题最容易追问哪些坑？
+## 2. 匿名字段为什么不是继承？
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+匿名字段是组合。外层类型拥有一个内层字段，字段和方法可以被提升，但外层类型不是内层类型的子类。
 
-- 以为结构体拷贝会深拷贝内部 slice 或 map。
-- 匿名嵌入导致字段名冲突或方法集变化。
-- tag 格式写错，编译能过但运行时行为不符合预期。
-- 把含 mutex 的结构体复制后继续使用。
+```go
+type Engine struct{}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+func (Engine) Start() {}
 
-### 4. 如何证明你的判断是对的？
+type Car struct {
+	Engine
+}
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+var c Car
+c.Start() // 方法提升
+```
 
-- 写测试验证结构体拷贝后内部 slice/map 是否共享。
-- 用 `go vet` 检查 tag 格式和 copylocks。
-- 用反射小例子读取 tag，理解框架如何工作。
+但不能把 `Car` 当成 `Engine` 传入：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+func UseEngine(e Engine) {}
 
-### 5. 当规模变大后，这个问题会如何升级？
+// UseEngine(c) // 编译错误
+UseEngine(c.Engine)
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+如果要表达能力，应该用接口：
 
-- 业务结构体简单时，值语义能减少共享状态。
-- 对象变大、字段含引用或并发状态后，复制成本和语义都要重新评估。
-- 公共结构体字段一旦导出，后续兼容性约束会显著增加。
+```go
+type Starter interface {
+	Start()
+}
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+func UseStarter(s Starter) {}
 
-### 6. 初学者应该怎么把这个问题学扎实？
+UseStarter(c) // 可以，因为 Car 的方法集中有 Start
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+## 3. 方法提升和字段提升会带来什么 API 风险？
+
+匿名嵌入的导出方法可能变成外层类型的公开 API。
+
+```go
+type DB struct{}
+
+func (DB) Close() error {
+	return nil
+}
+
+type Repository struct {
+	DB
+}
+```
+
+调用方可以直接：
+
+```go
+var r Repository
+_ = r.Close()
+```
+
+如果后续你想移除或替换 `DB`，`Repository.Close` 也可能变成兼容性负担。
+
+如果只是内部复用，具名未导出字段更稳：
+
+```go
+type Repository struct {
+	db DB
+}
+```
+
+面试回答要说明：匿名嵌入减少代码，但会扩大外层类型的方法集。
+
+## 4. tag 是谁解析的？写错为什么编译还能过？
+
+tag 本质上是结构体字段上的字符串。编译器只检查它是合法字符串字面量，不理解 `json`、`db`、`validate` 的业务规则。
+
+```go
+type User struct {
+	ID int64 `json:"id"`
+}
+```
+
+`encoding/json` 会通过反射读取：
+
+```go
+t := reflect.TypeOf(User{})
+f, _ := t.FieldByName("ID")
+fmt.Println(f.Tag.Get("json")) // id
+```
+
+写错 tag，编译可能仍然通过：
+
+```go
+type User struct {
+	ID int64 `json: "id"`
+}
+```
+
+但工具可以检查很多常见错误：
+
+```sh
+go vet ./...
+```
+
+## 5. 什么样的结构体可以用 `==` 比较？
+
+所有字段都可比较时，结构体才可比较。
+
+```go
+type Point struct {
+	X int
+	Y int
+}
+
+fmt.Println(Point{1, 2} == Point{1, 2}) // true
+```
+
+含 slice、map、func 字段时不可比较：
+
+```go
+type User struct {
+	Tags []string
+}
+
+// User{} == User{} // 编译错误
+```
+
+如果要比较 slice 字段，可以自己定义规则：
+
+```go
+func EqualUser(a, b User) bool {
+	return slices.Equal(a.Tags, b.Tags)
+}
+```
+
+不要用 `reflect.DeepEqual` 偷懒替代业务规则，尤其是 nil slice 和 empty slice 是否相等这类问题，要看你的契约。
+
+## 6. 含 `sync.Mutex` 的结构体为什么不能复制？
+
+因为复制会把锁状态也复制出去，锁保护的对象关系就不清楚了。
+
+```go
+type Counter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c Counter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+`Inc` 使用值接收者，会复制 `Counter`。锁住的是副本，原对象没有被修改。
+
+应该使用指针接收者：
+
+```go
+func (c *Counter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+检查命令：
+
+```sh
+go vet -copylocks ./...
+```

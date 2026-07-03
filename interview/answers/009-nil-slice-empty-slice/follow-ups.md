@@ -1,60 +1,191 @@
 # 009. nil 切片和空切片 - 面试追问
 
-## 追问与参考答案
+## 1. nil slice 和 empty slice 在 `len`、`cap`、`append`、`range` 上有什么区别？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+大多数普通操作没有区别。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+var a []int
+b := []int{}
 
-- 切片是描述符；nil 切片描述符中的数据指针为 nil。
-- 空切片可以来自字面量 `[]T{}` 或 `make([]T, 0)`，它表示“有一个空集合”。
-- append 对 nil slice 会分配新底层数组，这也是 nil slice 常被当作自然零值使用的原因。
-- 序列化框架会区分 nil 和 empty，因为它们表达的状态不同。
+fmt.Println(a == nil) // true
+fmt.Println(b == nil) // false
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+fmt.Println(len(a), cap(a)) // 0 0
+fmt.Println(len(b), cap(b)) // 0 0
 
-### 2. 这个知识点在真实项目里怎么取舍？
+for range a {
+	panic("不会执行")
+}
+for range b {
+	panic("不会执行")
+}
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+a = append(a, 1)
+b = append(b, 1)
 
-- 内部函数返回结果列表时，nil slice 往往更简单，调用方可以直接 range 和 append。
-- 对外 JSON API 通常倾向返回 `[]` 表示空列表，避免前端额外处理 null。
-- 需要表达“未加载”和“已加载但为空”时，nil 和 empty 可以承载不同语义。
-- 团队应统一接口约定，不要每个接口各自选择。
+fmt.Println(a) // [1]
+fmt.Println(b) // [1]
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+真正的区别主要在 `== nil`、序列化、反射比较和 API 语义上。
 
-### 3. 这道题最容易追问哪些坑？
+## 2. JSON 中为什么一个是 `null`，一个是 `[]`？
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+因为 encoding/json 会保留 nil slice 和非 nil 空 slice 的状态。
 
-- 为了避免 nil，写很多无意义的 `make([]T, 0)`。
-- 对外接口把 null 和 [] 混用，导致客户端兼容问题。
-- 用 `s == nil` 判断业务是否有数据，而不是用 `len(s)`。
-- 忽视 `omitempty` 对 nil 和 empty slice 的编码影响。
+```go
+var nilSlice []int
+emptySlice := []int{}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+a, _ := json.Marshal(nilSlice)
+b, _ := json.Marshal(emptySlice)
 
-### 4. 如何证明你的判断是对的？
+fmt.Println(string(a)) // null
+fmt.Println(string(b)) // []
+```
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+放在结构体里也一样：
 
-- 写单测覆盖 `json.Marshal(nilSlice)` 和 `json.Marshal(emptySlice)`。
-- 用 `len(s) == 0` 判断是否为空集合。
-- 在 API 契约测试中固定空列表的 JSON 形式。
+```go
+type Response struct {
+	Items []int `json:"items"`
+}
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+json.Marshal(Response{Items: nil})     // {"items":null}
+json.Marshal(Response{Items: []int{}}) // {"items":[]}
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+对外接口如果承诺返回数组，通常应该返回 `[]`，避免客户端同时处理 `null` 和数组两种类型。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 3. `omitempty` 会如何处理 nil slice 和 empty slice？
 
-- 单进程内部逻辑中差异通常不大。
-- 跨服务和前后端接口中，nil 与 empty 的语义差异会变成兼容性问题。
-- 有缓存或 ORM 层时，还要区分字段未加载、数据库 NULL 和空数组。
+都会省略，因为 slice 长度都是 0。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+type Response struct {
+	Items []int `json:"items,omitempty"`
+}
 
-### 6. 初学者应该怎么把这个问题学扎实？
+a, _ := json.Marshal(Response{Items: nil})
+b, _ := json.Marshal(Response{Items: []int{}})
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+fmt.Println(string(a)) // {}
+fmt.Println(string(b)) // {}
+```
+
+所以如果接口要求空列表也必须出现：
+
+```json
+{"items":[]}
+```
+
+字段就不要加 `omitempty`，并且编码前要保证它是 empty slice：
+
+```go
+func Normalize(items []int) []int {
+	if items == nil {
+		return []int{}
+	}
+	return items
+}
+```
+
+## 4. 为什么内部逻辑常用 nil slice，而对外 API 常用 empty slice？
+
+内部逻辑里 nil slice 更简单：
+
+```go
+func Collect(nums []int) []int {
+	var out []int
+	for _, n := range nums {
+		if n > 0 {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+```
+
+没有正数时返回 nil slice，但调用方仍然可以 `len`、`range`、`append`。
+
+对外 API 关注契约稳定。很多前端或其他语言客户端更希望空列表就是 `[]`：
+
+```go
+func WriteJSON(w http.ResponseWriter, items []Item) error {
+	if items == nil {
+		items = []Item{}
+	}
+	return json.NewEncoder(w).Encode(struct {
+		Items []Item `json:"items"`
+	}{
+		Items: items,
+	})
+}
+```
+
+边界层统一转换，比业务层到处 `make([]T, 0)` 更清晰。
+
+## 5. `reflect.DeepEqual(nilSlice, emptySlice)` 为什么是 false？
+
+因为它会区分 nil slice 和非 nil empty slice。
+
+```go
+var a []int
+b := []int{}
+
+fmt.Println(reflect.DeepEqual(a, b)) // false
+```
+
+测试时要按业务语义选择断言。
+
+如果只关心没有元素：
+
+```go
+if len(got) != 0 {
+	t.Fatalf("expected no items, got %v", got)
+}
+```
+
+如果关心 JSON 契约必须是 `[]`：
+
+```go
+if got == nil {
+	t.Fatal("expected empty slice, got nil")
+}
+```
+
+这道追问的重点是：测试应该表达契约，而不是无意识地把实现细节固定住。
+
+## 6. 什么时候应该用 `s == nil`，什么时候应该用 `len(s) == 0`？
+
+判断“有没有元素”，用 `len(s) == 0`。
+
+```go
+if len(users) == 0 {
+	return "no users"
+}
+```
+
+判断“有没有初始化”或“是否未加载”，才考虑 `s == nil`。
+
+```go
+type Result struct {
+	Items []Item
+}
+
+func (r Result) Loaded() bool {
+	return r.Items != nil
+}
+```
+
+不过更清楚的设计通常是显式字段：
+
+```go
+type Result struct {
+	Loaded bool
+	Items  []Item
+}
+```
+
+这样比让调用方猜 `nil` 的业务含义更稳。

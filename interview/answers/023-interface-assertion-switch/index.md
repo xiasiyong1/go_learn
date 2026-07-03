@@ -6,63 +6,207 @@
 
 ## 先给结论
 
-空接口表示“可以装任何值”，类型断言和 type switch 用来取回动态类型。深入理解接口要关注动态类型、方法集、小接口设计和运行时检查成本。
+`any` 是 `interface{}` 的别名，表示可以接收任意类型的值。
 
-## 深入理解
+接口值包含动态类型和动态值。类型断言用于把接口值里的动态值取回成某个具体类型或接口类型；type switch 用于根据动态类型分支处理。
 
-### 1. 这道题真正考察什么
+核心取舍：
 
-- 是否知道 `any` 是 `interface{}` 的别名。
-- 是否能区分类型断言的单返回值和双返回值形式。
-- 是否能解释 type switch 适合处理有限动态类型集合。
-- 是否理解接口应该由使用方定义，并保持小而聚焦。
+- 业务主流程尽量保留静态类型。
+- 确实面对未知类型时再用 `any`。
+- 普通输入分支用双返回值断言，不要用 panic 控制流程。
+- type switch 适合有限类型集合；分支太多时要考虑接口或泛型。
 
-### 2. 底层机制要讲清楚
+## any 适合什么
 
-- 接口值包含动态类型和动态值，调用接口方法时依据动态类型分派。
-- 类型断言 `v, ok := x.(T)` 检查接口动态值是否满足 T。
-- 单返回值断言失败会 panic，双返回值形式更适合普通控制流。
-- 空接口牺牲编译期类型信息，后续需要运行时检查来恢复具体类型。
-
-### 3. 工程实践怎么取舍
-
-- 处理 JSON、日志字段、插件输入等确实未知类型时可以使用 any。
-- 业务核心逻辑尽量保留静态类型，避免到处断言。
-- 接口方法越少，实现成本越低，替换和测试越容易。
-- type switch 分支变多时，考虑是否缺少多态接口或泛型抽象。
-
-### 4. 常见误区
-
-- 把 `interface{}` 当成泛型使用，丢失类型安全。
-- 单值断言失败 panic，导致普通输入错误变成崩溃。
-- 接口定义在生产者侧且方法过多，调用方被迫依赖不需要的能力。
-- 忽略 typed nil 导致断言后仍然可能拿到 nil 指针。
-
-## 如何验证理解
-
-- 写单测覆盖断言成功、失败和 typed nil。
-- 用编译期断言确认具体类型实现接口。
-- review 接口时检查每个方法是否被使用方真正需要。
-
-## 代码示例
+`any` 可以接收任意值：
 
 ```go
-switch v := x.(type) {
-case string:
-	fmt.Println("string", v)
-case int:
-	fmt.Println("int", v)
-default:
-	fmt.Println("unknown")
+func Print(v any) {
+	fmt.Printf("%T %v\n", v, v)
+}
+
+Print("go")
+Print(123)
+```
+
+适合：
+
+- 日志字段。
+- JSON 任意结构。
+- 插件系统边界。
+- 调试工具。
+- 泛型出现前的一些通用容器。
+
+不适合把业务核心逻辑都写成 `any`：
+
+```go
+func BadCreateUser(input any) error {
+	m := input.(map[string]any)
+	name := m["name"].(string)
+	_ = name
+	return nil
 }
 ```
+
+这会把类型错误从编译期推迟到运行时。
+
+更好的业务 API 是明确类型：
+
+```go
+type CreateUserRequest struct {
+	Name string
+}
+
+func CreateUser(req CreateUserRequest) error {
+	if req.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	return nil
+}
+```
+
+## 类型断言
+
+单返回值形式失败会 panic：
+
+```go
+var v any = "go"
+n := v.(int) // panic
+_ = n
+```
+
+双返回值形式更适合普通控制流：
+
+```go
+var v any = "go"
+
+n, ok := v.(int)
+if !ok {
+	return fmt.Errorf("expected int, got %T", v)
+}
+fmt.Println(n)
+```
+
+断言目标也可以是接口：
+
+```go
+type Stringer interface {
+	String() string
+}
+
+func Format(v any) string {
+	if s, ok := v.(Stringer); ok {
+		return s.String()
+	}
+	return fmt.Sprint(v)
+}
+```
+
+这不是判断动态类型是不是某个具体类型，而是判断动态值是否实现某个接口。
+
+## type switch
+
+type switch 适合有限类型集合：
+
+```go
+func Size(v any) int {
+	switch x := v.(type) {
+	case string:
+		return len(x)
+	case []byte:
+		return len(x)
+	case fmt.Stringer:
+		return len(x.String())
+	default:
+		return 0
+	}
+}
+```
+
+每个 case 里的 `x` 类型不同。
+
+如果分支越来越多：
+
+```go
+switch x := v.(type) {
+case A:
+case B:
+case C:
+case D:
+case E:
+}
+```
+
+要停下来问：是不是应该让这些类型实现同一个接口？
+
+```go
+type Sizer interface {
+	Size() int
+}
+```
+
+或者用泛型让编译期保留类型信息。
+
+## typed nil 仍然要小心
+
+类型断言成功，不代表断言出的指针非 nil。
+
+```go
+type MyError struct{}
+
+func (e *MyError) Error() string {
+	return "my error"
+}
+
+var e *MyError = nil
+var err error = e
+
+me, ok := err.(*MyError)
+fmt.Println(ok)        // true
+fmt.Println(me == nil) // true
+fmt.Println(err == nil) // false
+```
+
+`ok == true` 只说明动态类型是 `*MyError`，不说明动态值非 nil。
+
+使用断言结果前，如果它是指针，要按业务需要判 nil。
+
+## 接口应该小而靠近使用方
+
+不推荐生产者定义大接口：
+
+```go
+type UserRepository interface {
+	Create(User) error
+	Update(User) error
+	Delete(int64) error
+	Find(int64) (User, error)
+	List() ([]User, error)
+}
+```
+
+如果某个服务只需要查用户，就定义小接口：
+
+```go
+type UserFinder interface {
+	Find(id int64) (User, error)
+}
+
+type Service struct {
+	users UserFinder
+}
+```
+
+这样 mock 更容易，依赖更小，也不需要到处类型断言。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“类型断言和 type switch”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- `any` 和 `interface{}` 是什么关系？
+- 单返回值断言和双返回值断言有什么区别？
+- 类型断言目标是接口时，检查的是什么？
+- type switch 适合什么场景，什么时候说明设计有问题？
+- typed nil 断言成功后为什么还可能拿到 nil 指针？
+- 为什么业务核心逻辑不应该到处使用 `any`？

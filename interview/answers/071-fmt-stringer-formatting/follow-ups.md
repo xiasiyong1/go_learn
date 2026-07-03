@@ -1,60 +1,144 @@
 # 071. 格式化 - 面试追问
 
-## 追问与参考答案
+## 1. `%v`、`%+v`、`%#v`、`%T` 分别适合什么场景？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+用一个结构体就能看出区别。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type User struct {
+	Name string
+	Age  int
+}
 
-- `fmt` 根据格式化动词、操作数类型和相关接口决定输出。
-- 如果类型实现了 `String() string`，很多格式会使用该方法。
-- `%#v` 常用于输出 Go 语法风格表示，适合调试结构。
-- `%w` 只在 `fmt.Errorf` 中用于错误包装，不是普通打印动词。
+u := User{Name: "alice", Age: 18}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+fmt.Printf("%v\n", u)  // {alice 18}
+fmt.Printf("%+v\n", u) // {Name:alice Age:18}
+fmt.Printf("%#v\n", u) // main.User{Name:"alice", Age:18}
+fmt.Printf("%T\n", u)  // main.User
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+调试接口动态类型时，`%T` 很有用：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+var v any = []int{1, 2}
+fmt.Printf("%T\n", v) // []int
+```
 
-- 调试类型时用 `%T`，调试结构字段时用 `%+v` 或 `%#v`。
-- 打印用户可读枚举时实现 Stringer。
-- 日志中不要只依赖 fmt 字符串，结构化日志更适合机器检索。
-- 敏感字段的 String 输出要避免泄露 token、密码等信息。
+调试不可见字符时，用 `%q`：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+fmt.Printf("%q\n", "a\nb") // "a\nb"
+```
 
-### 3. 这道题最容易追问哪些坑？
+## 2. `Stringer` 为什么会导致递归？
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+因为 `fmt` 发现一个值实现了 `String() string` 后，会调用它。你在 `String` 里再用 `%v` 打印自己，就又触发 `String`。
 
-- String 方法中 `fmt.Sprintf("%v", x)` 再次调用 String，导致递归。
-- 用 `%v` 打印错误却丢失 wrapping 语义，判断错误仍应使用 errors.Is/As。
-- 把 fmt 当高性能序列化工具。
-- 日志输出结构体时泄露敏感信息。
+```go
+type User struct {
+	Name string
+}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+func (u User) String() string {
+	return fmt.Sprintf("%v", u) // 递归
+}
+```
 
-### 4. 如何证明你的判断是对的？
+正确写法是打印字段：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+func (u User) String() string {
+	return fmt.Sprintf("User(%s)", u.Name)
+}
+```
 
-- 写表格测试固定重要类型的 String 输出。
-- 用 `%T` 和 `%#v` 观察接口动态类型和结构体内容。
-- 对日志或错误输出增加敏感字段检查。
+或者转换成没有 `String` 方法的别名类型：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+type rawUser User
 
-### 5. 当规模变大后，这个问题会如何升级？
+func (u User) String() string {
+	return fmt.Sprintf("%+v", rawUser(u))
+}
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 3. `%w` 和 `%v` 包装 error 有什么区别？
 
-- 学习阶段 fmt 是观察程序行为的好工具。
-- 生产系统中输出要考虑结构化、性能和脱敏。
-- 公共类型的 String 表示一旦被用户依赖，就会变成兼容性的一部分。
+`%w` 会保留错误链，`errors.Is/As` 可以继续识别底层错误。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+base := os.ErrNotExist
+err := fmt.Errorf("open config: %w", base)
 
-### 6. 初学者应该怎么把这个问题学扎实？
+fmt.Println(errors.Is(err, os.ErrNotExist)) // true
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+`%v` 只把错误格式化成字符串，错误链断开。
+
+```go
+base := os.ErrNotExist
+err := fmt.Errorf("open config: %v", base)
+
+fmt.Println(errors.Is(err, os.ErrNotExist)) // false
+```
+
+所以业务代码需要保留错误语义时，用 `%w`；只是展示文本时才用 `%v`。
+
+## 4. 为什么日志里不能随便打印结构体？
+
+第一，可能泄露敏感字段。
+
+```go
+type Config struct {
+	User     string
+	Password string
+}
+
+cfg := Config{User: "root", Password: "secret"}
+fmt.Printf("%+v\n", cfg) // Password 会直接输出
+```
+
+第二，字段太多时日志不可检索。结构化日志更适合生产排查：
+
+```go
+logger.Info("login failed",
+	"user", userID,
+	"reason", reason,
+)
+```
+
+如果类型可能被日志打印，`String()` 里要主动脱敏：
+
+```go
+func (c Config) String() string {
+	return fmt.Sprintf("Config{User:%s Password:***}", c.User)
+}
+```
+
+## 5. 热点路径里为什么要少用 `fmt.Sprintf`？
+
+`fmt.Sprintf` 是通用格式化工具，要处理反射、接口和多种格式动词，通常会有更多开销。
+
+```go
+s := fmt.Sprintf("%d:%s", id, name)
+_ = s
+```
+
+简单整数转字符串用 `strconv` 更直接：
+
+```go
+s := strconv.Itoa(id) + ":" + name
+```
+
+大量拼接用 `strings.Builder`：
+
+```go
+var b strings.Builder
+b.WriteString(strconv.Itoa(id))
+b.WriteByte(':')
+b.WriteString(name)
+s := b.String()
+```
+
+不要凭感觉优化；如果怀疑 fmt 是热点，用 benchmark 和 pprof 验证。

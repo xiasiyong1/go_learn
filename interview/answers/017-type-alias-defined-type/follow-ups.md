@@ -1,60 +1,202 @@
 # 017. 类型别名和新类型 - 面试追问
 
-## 追问与参考答案
+## 1. `type A = B` 和 `type A B` 在赋值上有什么区别？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`type A = B` 是别名，`A` 和 `B` 是同一个类型。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type MyInt = int
 
-- 类型别名在编译器看来就是原类型，方法集和赋值规则基本等同原类型。
-- 新定义类型有独立身份，即使底层类型相同，也需要显式转换。
-- 新类型可以定义自己的方法，从而实现接口或封装校验逻辑。
-- 别名常用于包迁移时保持旧 API 可用。
+func UseInt(n int) {}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+var x MyInt = 10
+UseInt(x) // 可以
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+`type A B` 是新类型，`A` 和 `B` 是不同类型。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+type MyInt int
 
-- 重构包路径、拆分模块且要兼容旧调用方时，用类型别名过渡。
-- 表达 UserID、OrderID、Money 等业务概念时，用新类型增强类型安全。
-- 新类型对外暴露时要补齐构造、校验、序列化和字符串化能力。
-- 不要为了换名字滥用别名，别名不能提供新的约束。
+func UseInt(n int) {}
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+var x MyInt = 10
+// UseInt(x) // 编译错误
+UseInt(int(x))
+```
 
-### 3. 这道题最容易追问哪些坑？
+面试里可以一句话总结：别名解决兼容问题，新类型解决语义和约束问题。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. 新类型会不会继承底层类型的方法？
 
-- 以为 `type MyInt int` 可以直接传给需要 int 的函数。
-- 新类型丢失原类型方法后编译报错。
-- 用别名表达业务身份，结果不同概念仍然可以随意混用。
-- 迁移期别名保留过久，导致新旧路径长期并存。
+不会。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+type MyDuration time.Duration
 
-### 4. 如何证明你的判断是对的？
+var d MyDuration = MyDuration(time.Second)
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+// d.String() // 编译错误
+```
 
-- 写赋值和函数调用小例子，观察别名和新类型的编译差异。
-- 用编译期接口断言确认新类型是否实现目标接口。
-- 为新类型的 JSON、SQL、String 行为写单测。
+需要显式转换：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+fmt.Println(time.Duration(d).String())
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+或者给新类型定义自己的方法：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+func (d MyDuration) String() string {
+	return time.Duration(d).String()
+}
+```
 
-- 小范围代码里差异只是编译规则。
-- 大型代码库中，新类型能显著减少 ID、状态和单位混用。
-- 公共库迁移中，类型别名是兼容策略，不是长期设计目标。
+这让你可以控制新类型暴露什么行为，而不是自动继承底层类型的全部 API。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+## 3. 为什么 `UserID`、`OrderID` 更适合用新类型？
 
-### 6. 初学者应该怎么把这个问题学扎实？
+因为它们虽然底层都可能是 `int64`，但业务含义不同。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+type UserID int64
+type OrderID int64
+
+func LoadUser(id UserID) {}
+
+var oid OrderID = 1
+// LoadUser(oid) // 编译错误
+```
+
+如果用别名，就挡不住误传：
+
+```go
+type UserID = int64
+type OrderID = int64
+
+func LoadUser(id UserID) {}
+
+var oid OrderID = 1
+LoadUser(oid) // 可以，但语义错
+```
+
+新类型把一部分业务错误提前到编译期。
+
+## 4. 类型别名适合什么重构场景？
+
+适合包迁移、拆分模块、改名时保持兼容。
+
+旧包：
+
+```go
+package old
+
+type User struct {
+	ID int64
+}
+```
+
+新包：
+
+```go
+package user
+
+type User struct {
+	ID int64
+}
+```
+
+过渡期旧包可以写：
+
+```go
+package old
+
+import "example.com/app/user"
+
+type User = user.User
+```
+
+这样旧调用方可以继续编译，新代码可以逐步迁移到 `user.User`。
+
+但别名是兼容工具，不是长期设计目标。长期保留太多别名，会让代码库里同一概念有多个入口。
+
+## 5. 别名能不能增强类型安全？
+
+不能。别名只是另一个名字。
+
+```go
+type Email = string
+type Phone = string
+
+func SendEmail(e Email) {}
+
+var p Phone = "123456"
+SendEmail(p) // 可以，因为 Email 和 Phone 都是 string
+```
+
+如果要增强类型安全，用新类型：
+
+```go
+type Email string
+type Phone string
+
+func SendEmail(e Email) {}
+
+var p Phone = "123456"
+// SendEmail(p) // 编译错误
+```
+
+还可以把校验逻辑放到构造函数里：
+
+```go
+func NewEmail(s string) (Email, error) {
+	if !strings.Contains(s, "@") {
+		return "", fmt.Errorf("invalid email")
+	}
+	return Email(s), nil
+}
+```
+
+## 6. 新类型对外暴露时还需要补哪些方法或测试？
+
+常见补充：
+
+- `String()`：日志和调试输出。
+- `MarshalJSON` / `UnmarshalJSON`：外部 API。
+- `Scan` / `Value`：数据库读写。
+- `Valid()` 或构造函数：输入校验。
+
+示例：
+
+```go
+type Status int
+
+func (s Status) Valid() bool {
+	switch s {
+	case StatusPending, StatusRunning, StatusDone:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s Status) String() string {
+	if !s.Valid() {
+		return fmt.Sprintf("Status(%d)", s)
+	}
+	return [...]string{"pending", "running", "done"}[s]
+}
+```
+
+测试要覆盖非法值：
+
+```go
+func TestStatusInvalid(t *testing.T) {
+	if Status(99).Valid() {
+		t.Fatal("expected invalid status")
+	}
+}
+```
+
+新类型的收益来自“语义集中”，不是只换一个更好看的名字。

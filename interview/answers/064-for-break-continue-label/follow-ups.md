@@ -1,60 +1,162 @@
 # 064. 循环 - 面试追问
 
-## 追问与参考答案
+## 1. `for condition` 和 `for { if ... break }` 怎么选？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+如果循环条件一开始就能表达清楚，用 `for condition`。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+for len(queue) > 0 {
+	item := queue[0]
+	queue = queue[1:]
+	handle(item)
+}
+```
 
-- Go 没有 while 关键字，减少控制流语法种类。
-- `break` 不带标签时退出最近的 for、switch 或 select。
-- `continue` 不带标签时进入最近 for 的下一轮。
-- 带标签的 break/continue 让多层循环可以直接控制外层结构。
+如果退出条件依赖循环内部读取结果，用无限循环加 `break` 更自然。
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+```go
+for {
+	line, err := reader.ReadString('\n')
+	if err == io.EOF {
+		break
+	}
+	if err != nil {
+		return err
+	}
+	handle(line)
+}
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+判断标准是：退出条件放在循环头是否清楚。如果放到循环头反而要引入额外状态变量，就可以使用 `for {}`。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+## 2. 为什么 `switch` 里的 `break` 不会跳出外层循环？
 
-- 普通遍历用 `for i := 0; i < n; i++` 或 `for range`。
-- 条件循环用 `for condition`，比无限循环加内部 break 更直接。
-- 多层循环需要提前退出时可以用标签，但要保持标签名表达意图。
-- 复杂嵌套通常应拆函数，通过 return 简化控制流。
+因为不带标签的 `break` 退出最近的 `for`、`switch` 或 `select`。如果最近的是 `switch`，它只退出 `switch`。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+for _, v := range []int{1, 2, 3} {
+	switch v {
+	case 2:
+		break
+	}
+	fmt.Println("loop still runs:", v)
+}
+```
 
-### 3. 这道题最容易追问哪些坑？
+要退出外层循环，用标签：
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+Loop:
+for _, v := range []int{1, 2, 3} {
+	switch v {
+	case 2:
+		break Loop
+	}
+	fmt.Println(v)
+}
+```
 
-- 在 switch 中 break，只退出 switch，不退出外层 for。
-- 无限循环缺少退出条件，导致 CPU 空转或 goroutine 泄漏。
-- 标签滥用让控制流像 goto 一样难读。
-- range 中修改集合时没有理解遍历语义。
+也可以拆函数，用 `return` 替代标签：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+func firstNonOne(values []int) int {
+	for _, v := range values {
+		switch v {
+		case 1:
+			continue
+		default:
+			return v
+		}
+	}
+	return 0
+}
+```
 
-### 4. 如何证明你的判断是对的？
+## 3. 带标签的 `break` 和 `continue` 应该怎么读？
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+`break Label` 表示退出标签对应的循环；`continue Label` 表示进入标签对应循环的下一轮。
 
-- 写嵌套 for + switch 小例子验证 break 的目标。
-- 对循环退出条件写边界测试，覆盖空输入和异常输入。
-- 用 pprof 或测试超时发现意外无限循环。
+```go
+Outer:
+for i := 0; i < 3; i++ {
+	for j := 0; j < 3; j++ {
+		if j == 1 {
+			continue Outer
+		}
+		fmt.Println(i, j)
+	}
+}
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+这段代码中 `j == 1` 时，会直接进入下一轮 `i`，不会继续当前内层循环。
 
-### 5. 当规模变大后，这个问题会如何升级？
+标签适合少量使用。若标签让读者必须来回跳着读代码，就应该考虑拆函数。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 4. 循环中启动 goroutine 有什么风险？
 
-- 小循环问题容易定位。
-- 数据量大后，循环里的分配、锁和 I/O 会被放大。
-- 复杂流程应减少嵌套深度，避免后续维护者误判退出路径。
+风险有两个：数量失控和变量捕获。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+数量失控：
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```go
+for _, job := range jobs {
+	go process(job) // jobs 很大时会瞬间创建大量 goroutine
+}
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+更稳的方式是限制并发：
+
+```go
+sem := make(chan struct{}, 20)
+
+for _, job := range jobs {
+	sem <- struct{}{}
+	go func(job Job) {
+		defer func() { <-sem }()
+		process(job)
+	}(job)
+}
+```
+
+变量捕获在新版本 Go 中已经改善了常见 range 场景，但面试时仍应知道原则：传参给 goroutine 最清楚。
+
+```go
+for _, job := range jobs {
+	go func(job Job) {
+		process(job)
+	}(job)
+}
+```
+
+## 5. 遍历时删除元素为什么容易出错？
+
+正向遍历删除会改变后续元素位置，容易跳过元素。
+
+```go
+s := []int{1, 2, 2, 3}
+
+for i, v := range s {
+	if v == 2 {
+		s = append(s[:i], s[i+1:]...)
+	}
+}
+
+fmt.Println(s) // 可能不是你想要的结果
+```
+
+更清晰的过滤写法是原地构造新切片：
+
+```go
+s := []int{1, 2, 2, 3}
+dst := s[:0]
+
+for _, v := range s {
+	if v != 2 {
+		dst = append(dst, v)
+	}
+}
+
+fmt.Println(dst) // [1 3]
+```
+
+如果元素里有指针，并且原切片生命周期很长，过滤后还要考虑清理尾部引用，避免对象被底层数组继续持有。

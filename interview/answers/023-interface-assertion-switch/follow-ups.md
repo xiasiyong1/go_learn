@@ -1,60 +1,165 @@
 # 023. 类型断言和 type switch - 面试追问
 
-## 追问与参考答案
+## 1. `any` 和 `interface{}` 是什么关系？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`any` 是 `interface{}` 的别名。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+var a any = 1
+var b interface{} = "go"
 
-- 接口值包含动态类型和动态值，调用接口方法时依据动态类型分派。
-- 类型断言 `v, ok := x.(T)` 检查接口动态值是否满足 T。
-- 单返回值断言失败会 panic，双返回值形式更适合普通控制流。
-- 空接口牺牲编译期类型信息，后续需要运行时检查来恢复具体类型。
+fmt.Printf("%T %T\n", a, b)
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+它们表达的是同一件事：可以装任意类型的值。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+`any` 只是更直观，表示“任意值”。但不要因为名字更短就滥用。业务代码能用具体类型，就优先用具体类型。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+## 2. 单返回值断言和双返回值断言有什么区别？
 
-- 处理 JSON、日志字段、插件输入等确实未知类型时可以使用 any。
-- 业务核心逻辑尽量保留静态类型，避免到处断言。
-- 接口方法越少，实现成本越低，替换和测试越容易。
-- type switch 分支变多时，考虑是否缺少多态接口或泛型抽象。
+单返回值断言失败会 panic：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+var v any = "go"
+n := v.(int) // panic
+_ = n
+```
 
-### 3. 这道题最容易追问哪些坑？
+双返回值断言失败不会 panic：
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+var v any = "go"
+n, ok := v.(int)
+if !ok {
+	fmt.Println("not int")
+	return
+}
+fmt.Println(n)
+```
 
-- 把 `interface{}` 当成泛型使用，丢失类型安全。
-- 单值断言失败 panic，导致普通输入错误变成崩溃。
-- 接口定义在生产者侧且方法过多，调用方被迫依赖不需要的能力。
-- 忽略 typed nil 导致断言后仍然可能拿到 nil 指针。
+普通输入校验和业务分支应该用双返回值形式。单返回值形式只适合你已经能证明类型一定正确的内部代码。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+## 3. 类型断言目标是接口时，检查的是什么？
 
-### 4. 如何证明你的判断是对的？
+检查动态值是否实现目标接口。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+type Stringer interface {
+	String() string
+}
 
-- 写单测覆盖断言成功、失败和 typed nil。
-- 用编译期断言确认具体类型实现接口。
-- review 接口时检查每个方法是否被使用方真正需要。
+func Format(v any) string {
+	s, ok := v.(Stringer)
+	if ok {
+		return s.String()
+	}
+	return fmt.Sprint(v)
+}
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+如果传入的是 `time.Duration`，它实现了 `String()`，断言就成功。
 
-### 5. 当规模变大后，这个问题会如何升级？
+这和断言具体类型不同：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+if d, ok := v.(time.Duration); ok {
+	return d.String()
+}
+```
 
-- 小范围工具函数里 any 可以减少样板。
-- 大型业务代码里滥用 any 会让错误从编译期延迟到运行时。
-- 公共 API 一旦暴露宽接口，后续收窄会破坏兼容性。
+接口断言更强调能力，具体类型断言更强调类型身份。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+## 4. type switch 适合什么场景，什么时候说明设计有问题？
 
-### 6. 初学者应该怎么把这个问题学扎实？
+适合处理有限、明确的动态类型集合：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+func ToString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	case fmt.Stringer:
+		return x.String()
+	default:
+		return fmt.Sprint(x)
+	}
+}
+```
+
+如果 type switch 分支不断增长，通常说明缺少抽象。
+
+```go
+switch v.(type) {
+case EmailMessage:
+case SMSMessage:
+case PushMessage:
+case WebhookMessage:
+}
+```
+
+可以考虑接口：
+
+```go
+type Sender interface {
+	Send(context.Context) error
+}
+```
+
+让每个类型自己实现行为，而不是中心化地判断所有类型。
+
+## 5. typed nil 断言成功后为什么还可能拿到 nil 指针？
+
+因为断言检查的是动态类型是否匹配，不保证动态值非 nil。
+
+```go
+type MyError struct{}
+
+func (e *MyError) Error() string {
+	return "my error"
+}
+
+var e *MyError = nil
+var err error = e
+
+me, ok := err.(*MyError)
+fmt.Println(ok)        // true
+fmt.Println(me == nil) // true
+```
+
+`err` 的动态类型是 `*MyError`，所以断言成功；动态值是 nil，所以 `me == nil`。
+
+使用断言结果前，要根据业务判断 nil 是否允许。
+
+## 6. 为什么业务核心逻辑不应该到处使用 `any`？
+
+因为它丢掉了编译期类型检查。
+
+不推荐：
+
+```go
+func Calculate(input any) int {
+	m := input.(map[string]any)
+	price := m["price"].(int)
+	count := m["count"].(int)
+	return price * count
+}
+```
+
+任何字段名或类型错误都会在运行时 panic。
+
+推荐明确建模：
+
+```go
+type OrderLine struct {
+	Price int
+	Count int
+}
+
+func Calculate(line OrderLine) int {
+	return line.Price * line.Count
+}
+```
+
+`any` 适合边界层和通用工具，不适合把核心业务模型变成动态类型。

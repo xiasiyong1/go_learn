@@ -1,60 +1,195 @@
 # 022. panic 和 recover - 面试追问
 
-## 追问与参考答案
+## 1. panic 发生后 defer 的执行顺序是什么？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+panic 后，当前函数停止正常执行，开始按后进先出顺序执行 defer。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+func f() {
+	defer fmt.Println("first")
+	defer fmt.Println("second")
 
-- panic 发生后，函数停止正常执行，开始沿调用栈执行 defer。
-- recover 成功后，当前 goroutine 可以从 defer 返回，函数返回其返回值。
-- 不同 goroutine 有独立调用栈，一个 goroutine 的 recover 不能跨栈捕获另一个 goroutine 的 panic。
-- runtime 的 fatal error 通常不可 recover，例如并发 map 写导致的 fatal error。
+	panic("boom")
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+输出：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```text
+second
+first
+panic: boom
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+如果某个 defer 成功 recover，panic 展开会停止，函数返回。
 
-- 库函数通常返回 error，不要让调用方被迫 recover。
-- HTTP middleware、任务执行器、goroutine 启动边界可以 recover 并记录堆栈，避免进程直接崩溃。
-- recover 后要把 panic 转成明确错误或日志，不要静默吞掉。
-- 内部不变量被破坏时可以 panic，但要让边界清晰。
+```go
+func f() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("recovered:", r)
+		}
+	}()
+	panic("boom")
+}
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. recover 为什么必须在 defer 函数中直接调用？
 
-### 3. 这道题最容易追问哪些坑？
+`recover` 只有在 panic 展开过程中，由 defer 函数直接调用才有效。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+有效：
 
-- 把 panic 当异常机制写业务分支。
-- 在 goroutine 外层没有 recover，导致后台任务 panic 杀死进程。
-- recover 后不记录堆栈，问题根因丢失。
-- 以为所有 panic 都能 recover，包括 fatal error。
+```go
+defer func() {
+	if r := recover(); r != nil {
+		fmt.Println(r)
+	}
+}()
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+无效：
 
-### 4. 如何证明你的判断是对的？
+```go
+func doRecover() {
+	recover()
+}
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+defer func() {
+	doRecover()
+}()
+```
 
-- 写小例子验证 recover 的调用位置和 goroutine 边界。
-- 为 goroutine wrapper 写单测，确认 panic 会被转成错误或日志。
-- 在线上服务中配合 structured log 输出 panic 值和 stack trace。
+第二种写法里，`recover` 不是 defer 函数直接调用，不能恢复 panic。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+面试时可以说：recover 的有效位置非常窄，不是到处调用都能捕获异常。
 
-### 5. 当规模变大后，这个问题会如何升级？
+## 3. recover 能不能捕获另一个 goroutine 的 panic？
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+不能。
 
-- 命令行小工具可以让不可恢复错误直接退出。
-- 长期运行服务必须在请求边界和任务边界兜底 recover。
-- 系统越复杂，越要限制 panic 的使用范围，否则控制流难以维护。
+```go
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("main recovered:", r)
+		}
+	}()
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+	go func() {
+		panic("worker panic")
+	}()
 
-### 6. 初学者应该怎么把这个问题学扎实？
+	time.Sleep(time.Second)
+}
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+`main` 的 recover 捕获不到 worker goroutine 的 panic。
+
+正确做法是在 goroutine 内部加 recover：
+
+```go
+go func() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("worker panic", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
+	doWork()
+}()
+```
+
+不同 goroutine 有独立调用栈，recover 不能跨栈。
+
+## 4. HTTP 服务里应该在哪里 recover？
+
+应该在请求边界，比如 middleware。
+
+```go
+func Recover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				slog.Error("panic",
+					"panic", v,
+					"path", r.URL.Path,
+					"stack", string(debug.Stack()),
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+这样能防止单个请求 panic 直接结束进程。
+
+但业务层仍然应该返回 error：
+
+```go
+func CreateUser(req CreateUserRequest) error {
+	if req.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	return nil
+}
+```
+
+不要把 recover 当成业务错误处理器。
+
+## 5. recover 后为什么要记录 stack？
+
+panic 通常说明出现了未预期路径。只有 panic 值往往不够定位问题。
+
+不推荐：
+
+```go
+defer func() {
+	_ = recover()
+}()
+```
+
+推荐：
+
+```go
+defer func() {
+	if r := recover(); r != nil {
+		slog.Error("panic recovered",
+			"panic", r,
+			"stack", string(debug.Stack()),
+		)
+	}
+}()
+```
+
+堆栈能告诉你 panic 发生在哪一行、调用链是什么，这比只看 `"panic: index out of range"` 有用得多。
+
+## 6. panic 和 error 的边界应该怎么划分？
+
+普通、可预期、调用方能处理的失败，用 error。
+
+```go
+func OpenConfig(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	return b, nil
+}
+```
+
+不变量被破坏、程序员错误、无法继续的状态，可以考虑 panic。
+
+```go
+func MustRegister(name string, h Handler) {
+	if name == "" || h == nil {
+		panic("invalid handler registration")
+	}
+	registry[name] = h
+}
+```
+
+经验是：库函数不要轻易 panic 逼调用方 recover；服务边界可以 recover 兜底，但业务流程仍然应该用 error 表达失败。

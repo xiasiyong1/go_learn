@@ -1,60 +1,189 @@
 # 018. 可比较类型 - 面试追问
 
-## 追问与参考答案
+## 1. 哪些类型不能用 `==` 比较？它们能和 `nil` 比较吗？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+slice、map、func 不能彼此比较。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+a := []int{1}
+b := []int{1}
 
-- 基础类型、指针、channel、可比较元素组成的数组和结构体都可比较。
-- slice、map、func 内部包含引用状态或函数值，语言不定义通用相等语义。
-- map key 需要稳定的哈希和相等判断，所以必须可比较。
-- 接口静态类型看似可比较，但比较时要看其中装入的动态值是否可比较。
+// fmt.Println(a == b) // 编译错误
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+但它们可以和 `nil` 比较：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+var s []int
+var m map[string]int
+var f func()
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+fmt.Println(s == nil) // true
+fmt.Println(m == nil) // true
+fmt.Println(f == nil) // true
+```
 
-- 需要把复合数据作为 key 时，优先设计可比较结构体或编码成稳定字符串。
-- 需要比较 slice 内容时，用 `slices.Equal` 或自定义比较，而不是 `==`。
-- 泛型函数需要使用 `==` 时，加 `comparable` 约束。
-- 对接口值做比较前，确认不会装入 slice、map、func 等不可比较动态值。
+如果要比较内容，选择对应工具：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+slices.Equal([]int{1}, []int{1})
+maps.Equal(map[string]int{"a": 1}, map[string]int{"a": 1})
+```
 
-### 3. 这道题最容易追问哪些坑？
+func 通常没有通用内容相等语义，只能判断是否为 nil。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. 数组和结构体什么时候可以比较？
 
-- 结构体新增 slice 字段后，原本可比较的类型突然不可比较。
-- 把 `any` 值直接放进 map key 或做 `==`，运行时 panic。
-- 把指针相等误认为内容相等。
-- 泛型里忘记加 comparable，却在函数体中使用 `==`。
+数组元素可比较，数组就可比较：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+fmt.Println([2]string{"a", "b"} == [2]string{"a", "b"}) // true
+```
 
-### 4. 如何证明你的判断是对的？
+数组元素不可比较，数组就不可比较：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+// _ = [1][]int{} == [1][]int{} // 编译错误
+```
 
-- 写编译期例子验证哪些类型可比较。
-- 用单测覆盖接口中装入不可比较类型后比较 panic 的情况。
-- 对 map key 类型新增字段时跑编译和测试，确认可比较性没有被破坏。
+结构体要求所有字段都可比较：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+type Key struct {
+	TenantID int64
+	UserID   int64
+}
 
-### 5. 当规模变大后，这个问题会如何升级？
+fmt.Println(Key{1, 2} == Key{1, 2}) // true
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+新增不可比较字段会改变整个结构体的可比较性：
 
-- 简单类型比较没有成本问题。
-- 大数组或大结构体比较可能有明显成本，需要评估是否应该比较摘要或 ID。
-- 公共 key 类型的可比较性变化会影响大量调用方，是兼容性风险。
+```go
+type Key struct {
+	TenantID int64
+	UserID   int64
+	Tags     []string
+}
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+// Key{} == Key{} // 编译错误
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+公共 key 类型要谨慎加字段。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+## 3. 为什么 map key 必须可比较？
+
+map 查找需要哈希和相等判断。
+
+```go
+type Key struct {
+	Path string
+	Lang string
+}
+
+m := map[Key]string{}
+m[Key{Path: "/home", Lang: "zh"}] = "首页"
+```
+
+`Key` 可比较，所以 map 能判断两次查询是不是同一个 key。
+
+slice 不可作为 key：
+
+```go
+// m := map[[]byte]int{} // 编译错误
+```
+
+如果你想用 `[]byte` 的内容做 key，可以转成 string：
+
+```go
+func Lookup(m map[string]int, b []byte) int {
+	return m[string(b)]
+}
+```
+
+但这里通常会发生转换和分配，热点路径要用 benchmark 验证成本。
+
+## 4. interface 比较为什么可能运行时 panic？
+
+接口的静态类型可以比较，但比较时要看动态值是否可比较。
+
+```go
+var a any = "go"
+var b any = "go"
+fmt.Println(a == b) // true
+```
+
+动态值是 slice 时：
+
+```go
+var a any = []int{1}
+var b any = []int{1}
+
+fmt.Println(a == b) // panic
+```
+
+同理，`map[any]V` 也可能 panic：
+
+```go
+m := map[any]int{}
+m["ok"] = 1
+
+// m[[]int{1}] = 2 // panic
+```
+
+如果 key 来自外部输入，最好设计明确的 key 类型，不要用 `any` 兜底。
+
+## 5. 指针相等和内容相等有什么区别？
+
+指针相等比较的是地址是否相同。
+
+```go
+a := User{Name: "Tom"}
+b := User{Name: "Tom"}
+c := &a
+
+fmt.Println(&a == &b) // false
+fmt.Println(&a == c)  // true
+```
+
+如果业务要比较内容，需要比较字段：
+
+```go
+func EqualUser(a, b *User) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Name == b.Name
+}
+```
+
+不要因为指针可比较，就默认它满足业务相等语义。
+
+## 6. 泛型里的 `comparable` 解决了什么问题，又不解决什么问题？
+
+它让编译器知道类型参数支持 `==` 和 `!=`。
+
+```go
+func Contains[T comparable](items []T, target T) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+```
+
+如果写成 `T any`，函数体里不能用 `==` 比较 `T`。
+
+但 `comparable` 不保证业务相等语义正确：
+
+```go
+type User struct {
+	ID int64
+}
+
+// 比较 User 会比较所有字段，不一定等于“同一个用户”的业务定义。
+```
+
+如果业务相等只看 ID，就应该写明确的比较函数，而不是机械依赖 `==`。

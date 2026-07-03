@@ -1,60 +1,132 @@
 # 080. 构建 - 面试追问
 
-## 追问与参考答案
+## 1. `//go:build` 应该放在哪里？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+放在文件开头附近，通常第一行，然后空一行再写 `package`。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+//go:build integration
 
-- Go 工具链根据 build constraints 决定某个文件是否进入当前包构建。
-- 平台后缀如 `_windows.go`、`_amd64.go` 是内置条件。
-- `_test.go` 文件只在测试构建中参与。
-- 自定义 tag 需要通过 `go build -tags` 或 `go test -tags` 指定。
+package repo
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+import "testing"
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+不要放到 package 后面：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+package repo
 
-- 平台系统调用差异适合用平台文件拆分。
-- 集成测试、慢测试、依赖外部服务的测试可以用 tag 隔离。
-- 同一组条件编译文件应提供一致 API，调用方不需要关心平台差异。
-- 保持 tag 数量少，并在 README 或测试命令里说明。
+//go:build integration // 错误位置，不会按预期作为构建约束
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+实际项目里建议统一格式，避免 tag 看起来写了但没生效。
 
-### 3. 这道题最容易追问哪些坑？
+## 2. build tag 和文件名平台后缀有什么关系？
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+它们都会影响文件是否参与构建。
 
-- 某些 tag 下缺少实现，平时构建通过，发布构建失败。
-- build tag 注释位置不对，约束没有生效。
-- 条件编译分支太多，测试覆盖不到所有组合。
-- 用 build tag 隐藏业务逻辑差异，导致行为难以排查。
+```text
+net_linux.go
+net_windows.go
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+这些后缀由 Go 工具链自动识别，不需要写 tag。
 
-### 4. 如何证明你的判断是对的？
+也可以叠加：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+//go:build linux && cgo
 
-- 用 `go test ./...` 和关键 `go test -tags ... ./...` 都跑一遍。
-- 在 CI 中覆盖目标 GOOS/GOARCH 或 tag 组合。
-- 用 `go list` 检查特定条件下参与构建的文件。
+package netx
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+这个文件只有在 linux 且启用 cgo 条件下才参与构建。
 
-### 5. 当规模变大后，这个问题会如何升级？
+## 3. 如何为不同平台提供同一个函数的不同实现？
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+拆成多个文件，保持包名和函数签名一致。
 
-- 少量平台差异用 build tag 很清晰。
-- 多平台库必须系统测试各平台实现。
-- tag 组合过多会产生隐形代码路径，维护成本快速上升。
+```go
+// file: home_unix.go
+//go:build linux || darwin
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+package env
 
-### 6. 初学者应该怎么把这个问题学扎实？
+func HomeDir() string {
+	return getenv("HOME")
+}
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+// file: home_windows.go
+//go:build windows
+
+package env
+
+func HomeDir() string {
+	return getenv("USERPROFILE")
+}
+```
+
+调用方只调用：
+
+```go
+dir := env.HomeDir()
+```
+
+不要让调用方到处写 `runtime.GOOS` 判断，除非差异非常简单且不需要条件编译。
+
+## 4. 为什么 tag 过多会增加维护成本？
+
+每个 tag 都可能制造一条新的构建路径。
+
+```text
+default
+integration
+enterprise
+linux
+windows
+linux + enterprise
+windows + enterprise
+```
+
+如果 CI 只跑默认路径，其他路径可能长期坏掉。
+
+典型风险：
+
+- 某个 tag 下缺函数实现。
+- 某个平台文件使用了不存在的系统调用。
+- 集成测试 tag 下依赖环境变量，但文档没写。
+- 两个 tag 组合后出现重复定义。
+
+所以 tag 要少，用途要明确，并且关键组合要自动测试。
+
+## 5. 如何确认某个 tag 下代码真的会编译？
+
+直接跑目标构建。
+
+```bash
+go test -tags integration ./...
+```
+
+跨平台：
+
+```bash
+GOOS=linux GOARCH=amd64 go test ./...
+GOOS=windows GOARCH=amd64 go test ./...
+```
+
+查看文件列表：
+
+```bash
+go list -json -tags integration .
+```
+
+关注输出里的：
+
+- `GoFiles`
+- `TestGoFiles`
+- `IgnoredGoFiles`
+
+这能帮助你确认某个文件到底有没有进入构建。

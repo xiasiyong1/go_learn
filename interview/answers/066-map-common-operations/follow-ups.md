@@ -1,60 +1,160 @@
 # 066. map 操作 - 面试追问
 
-## 追问与参考答案
+## 1. `m[k]` 和 `v, ok := m[k]` 应该怎么选？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+如果业务上只需要值，并且零值就是合理默认值，可以直接用 `m[k]`。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+counts := map[string]int{}
+counts["go"]++
 
-- map 查找返回一个值副本；单返回值形式无法表达 key 是否存在。
-- `comma ok` 通过第二个布尔值告诉调用方 key 是否存在。
-- `delete` 是内置函数，不要求 key 一定存在。
-- nil map 没有底层哈希表，写入时无法放置元素，因此 panic。
+fmt.Println(counts["go"])   // 1
+fmt.Println(counts["java"]) // 0，合理默认值
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+如果零值也是合法业务值，就必须用 `comma ok`。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+ages := map[string]int{
+	"baby": 0,
+}
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+age, ok := ages["bob"]
+if !ok {
+	fmt.Println("not found")
+} else {
+	fmt.Println(age)
+}
+```
 
-- 计数场景可以利用零值：`m[k]++`。
-- 缓存或配置读取需要区分零值时必须使用 comma ok。
-- 删除前不需要先判断存在，直接 delete 即可。
-- 创建需要写入的 map 时用 `make`，并根据规模给容量提示。
+判断标准不是类型，而是业务语义：零值能不能代表“默认值”。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. nil map、空 map 和已经初始化的 map 行为有什么区别？
 
-### 3. 这道题最容易追问哪些坑？
+nil map 没有底层哈希表。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+var nilMap map[string]int
+fmt.Println(nilMap == nil) // true
+fmt.Println(nilMap["x"])   // 0
+delete(nilMap, "x")        // 安全
 
-- 把空字符串、0、false 当成 key 不存在。
-- 对 nil map 赋值导致 panic。
-- 直接修改 map 中结构体字段，忘记 map 返回的是副本。
-- 并发读写普通 map，导致数据竞争或运行时 fatal error。
+// nilMap["x"] = 1         // panic
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+空 map 已经初始化，可以写。
 
-### 4. 如何证明你的判断是对的？
+```go
+empty := map[string]int{}
+fmt.Println(empty == nil) // false
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+empty["x"] = 1
+fmt.Println(empty)
+```
 
-- 写测试覆盖不存在 key 和存在但值为零值的场景。
-- 写 nil map 读、删、写的小例子理解边界。
-- 用 `go test -race` 检查并发访问 map 的代码。
+`make` 创建的 map 也是已初始化 map：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+m := make(map[string]int, 100)
+m["x"] = 1
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+容量参数只是提示，不是长度，也不能用 `len` 看到容量。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 3. 为什么 map 中结构体字段不能直接修改？
 
-- 小程序中 map 常是最方便的索引结构。
-- 配置、缓存、统计场景中，零值和不存在的语义必须清楚。
-- 数据规模和并发上来后，要考虑预分配、key 设计和并发安全。
+map 查找返回的是 value 的副本，不是稳定地址。map 扩容时元素位置可能变化，所以 Go 不允许你直接取 map 元素字段地址或修改字段。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+type Counter struct {
+	N int
+}
 
-### 6. 初学者应该怎么把这个问题学扎实？
+m := map[string]Counter{
+	"a": {N: 1},
+}
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+// m["a"].N++ // 编译失败
+```
+
+取出、修改、写回：
+
+```go
+c := m["a"]
+c.N++
+m["a"] = c
+```
+
+如果频繁修改，可以存指针：
+
+```go
+mp := map[string]*Counter{
+	"a": {N: 1},
+}
+
+mp["a"].N++
+```
+
+但指针 map 要处理 key 不存在时的 nil 问题：
+
+```go
+if c := mp["missing"]; c != nil {
+	c.N++
+}
+```
+
+## 4. `map[string]bool` 和 `map[string]struct{}` 怎么选？
+
+如果 value 的真假有业务含义，用 `map[string]bool`。
+
+```go
+enabled := map[string]bool{
+	"feature-a": false, // 明确配置为 false
+}
+
+v, ok := enabled["feature-a"]
+fmt.Println(v, ok) // false true
+```
+
+如果只表示集合存在性，用 `map[string]struct{}` 更准确。
+
+```go
+set := map[string]struct{}{
+	"alice": {},
+}
+
+_, ok := set["alice"]
+fmt.Println(ok)
+```
+
+`struct{}` 不占额外数据空间，更重要的是语义清楚：只关心 key 是否存在。
+
+## 5. 遍历 map 时删除 key 是否安全？
+
+在同一个 goroutine 中，遍历 map 时删除 key 是允许的。
+
+```go
+m := map[string]int{
+	"a": 1,
+	"b": 2,
+	"c": 3,
+}
+
+for k, v := range m {
+	if v%2 == 1 {
+		delete(m, k)
+	}
+}
+
+fmt.Println(m)
+```
+
+但遍历时新增 key，不应该依赖新 key 是否会被遍历到。
+
+```go
+for k := range m {
+	m[k+"x"] = 100 // 是否在本轮遍历到，不要依赖
+}
+```
+
+并发场景是另一个问题：一个 goroutine 遍历，另一个 goroutine 写 map，是数据竞争，可能直接 fatal error。需要锁、`sync.Map` 或改变所有权模型。

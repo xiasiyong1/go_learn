@@ -1,60 +1,215 @@
 # 020. JSON 和结构体 tag - 面试追问
 
-## 追问与参考答案
+## 1. 未导出字段加 JSON tag 为什么没有效果？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`encoding/json` 只处理导出字段。tag 不会改变字段可见性。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type User struct {
+	ID   int64  `json:"id"`
+	name string `json:"name"`
+}
 
-- encoding/json 通过反射读取导出字段和 tag。
-- `omitempty` 根据类型空值判断，0、false、空串、nil、空 slice/map 都可能被省略。
-- 解码时字段不存在会保留目标字段原值；解到新结构体时就是零值。
-- 指针字段可以表达三态：未传、传 null、传具体值，但需要谨慎设计。
+u := User{ID: 1, name: "Tom"}
+b, _ := json.Marshal(u)
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+fmt.Println(string(b)) // {"id":1}
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+`name` 小写开头，包外不可见，反射也不能按普通方式设置它，所以不会参与 JSON。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+正确写法：
 
-- 对外 API 字段名应由 tag 固定，避免 Go 字段名变化影响协议。
-- PATCH 或部分更新接口用指针、自定义类型或 map 区分未传和零值。
-- 需要严格校验未知字段时使用 Decoder 的 `DisallowUnknownFields`。
-- 性能极敏感时再考虑替代 JSON 库，先确认瓶颈。
+```go
+type User struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. `omitempty` 会省略哪些值？为什么 `false` 和 `0` 容易出问题？
 
-### 3. 这道题最容易追问哪些坑？
+`omitempty` 会省略空值，包括：
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+- `false`
+- `0`
+- `""`
+- nil 指针、nil interface
+- 长度为 0 的 slice、map、string
 
-- 未导出字段加 tag 也不会被 encoding/json 处理。
-- 用 omitempty 后，false 或 0 被省略，导致客户端无法区分真实零值。
-- 自定义 `UnmarshalJSON` 中递归调用自己导致栈溢出。
-- 忽视时间、浮点数、数字精度和 unknown fields 的兼容性。
+```go
+type Config struct {
+	Enabled bool `json:"enabled,omitempty"`
+	Limit   int  `json:"limit,omitempty"`
+}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+b, _ := json.Marshal(Config{Enabled: false, Limit: 0})
+fmt.Println(string(b)) // {}
+```
 
-### 4. 如何证明你的判断是对的？
+问题是：`false` 和 `0` 可能是业务上明确传递的值。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+如果需要表达“传了 false”，用指针：
 
-- 为 JSON 输出写 golden test，固定字段名、null 和 [] 行为。
-- 用表格测试覆盖字段缺失、字段为 null、字段为零值。
-- 对兼容性敏感的 API 增加反序列化旧版本样例测试。
+```go
+type Config struct {
+	Enabled *bool `json:"enabled,omitempty"`
+}
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+enabled := false
+b, _ := json.Marshal(Config{Enabled: &enabled})
+fmt.Println(string(b)) // {"enabled":false}
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+## 3. 解码时字段缺失、字段为 `null`、字段为零值有什么区别？
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+普通值字段：
 
-- 内部工具可以容忍简单结构体直接 Marshal。
-- 对外 API 需要稳定协议、清晰 null 语义和版本兼容策略。
-- 高吞吐服务中 JSON 编解码可能成为 CPU 和分配热点，需要 profiling 后再优化。
+```go
+type User struct {
+	Age int `json:"age"`
+}
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+缺失字段解到新结构体是零值：
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```go
+var u User
+_ = json.Unmarshal([]byte(`{}`), &u)
+fmt.Println(u.Age) // 0
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+传零值也是 0：
+
+```go
+_ = json.Unmarshal([]byte(`{"age":0}`), &u)
+fmt.Println(u.Age) // 0
+```
+
+所以普通 `int` 区分不了缺失和传 0。
+
+指针字段可以区分缺失和具体值：
+
+```go
+type PatchUser struct {
+	Age *int `json:"age"`
+}
+
+var p PatchUser
+_ = json.Unmarshal([]byte(`{"age":0}`), &p)
+fmt.Println(p.Age == nil) // false
+```
+
+但缺失和 `null` 都会得到 nil：
+
+```go
+_ = json.Unmarshal([]byte(`{}`), &p)
+fmt.Println(p.Age == nil) // true
+
+_ = json.Unmarshal([]byte(`{"age":null}`), &p)
+fmt.Println(p.Age == nil) // true
+```
+
+要区分三态，需要自定义类型或 `json.RawMessage`。
+
+## 4. 如何区分 PATCH 请求里的“未传”和“传了零值”？
+
+常见做法是使用指针字段：
+
+```go
+type PatchUser struct {
+	Name *string `json:"name"`
+	Age  *int    `json:"age"`
+}
+
+func Apply(u *User, p PatchUser) {
+	if p.Name != nil {
+		u.Name = *p.Name
+	}
+	if p.Age != nil {
+		u.Age = *p.Age
+	}
+}
+```
+
+客户端传：
+
+```json
+{"age":0}
+```
+
+`Age != nil`，且 `*Age == 0`。
+
+如果业务还要区分 `null` 表示清空，可以先解码成 raw message：
+
+```go
+var raw map[string]json.RawMessage
+_ = json.Unmarshal(data, &raw)
+
+ageRaw, exists := raw["age"]
+if !exists {
+	// 未传
+} else if string(ageRaw) == "null" {
+	// 传了 null
+} else {
+	// 传了具体值
+}
+```
+
+## 5. nil slice 和 empty slice 的 JSON 输出有什么区别？
+
+nil slice 输出 `null`，empty slice 输出 `[]`。
+
+```go
+type Response struct {
+	Items []string `json:"items"`
+}
+
+a, _ := json.Marshal(Response{Items: nil})
+b, _ := json.Marshal(Response{Items: []string{}})
+
+fmt.Println(string(a)) // {"items":null}
+fmt.Println(string(b)) // {"items":[]}
+```
+
+如果字段带 `omitempty`，两者都会省略：
+
+```go
+type Response struct {
+	Items []string `json:"items,omitempty"`
+}
+
+json.Marshal(Response{Items: nil})        // {}
+json.Marshal(Response{Items: []string{}}) // {}
+```
+
+对外 API 如果承诺数组字段一直存在，就不要加 `omitempty`，并在输出前把 nil 归一化成 empty slice。
+
+## 6. 自定义 `UnmarshalJSON` 为什么容易递归？
+
+因为在 `UnmarshalJSON` 方法里对同一个类型调用 `json.Unmarshal`，会再次调用这个方法。
+
+错误示例：
+
+```go
+func (u *User) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, u)
+}
+```
+
+正确做法是定义一个没有该方法的新类型：
+
+```go
+func (u *User) UnmarshalJSON(data []byte) error {
+	type Alias User
+	var aux Alias
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*u = User(aux)
+	return nil
+}
+```
+
+`Alias` 是新类型，没有 `UnmarshalJSON` 方法，所以不会递归。

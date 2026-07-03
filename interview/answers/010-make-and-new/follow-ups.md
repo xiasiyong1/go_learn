@@ -1,60 +1,188 @@
 # 010. make 和 new - 面试追问
 
-## 追问与参考答案
+## 1. `new(T)` 的返回值是什么？它是否会初始化 map/channel？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`new(T)` 返回 `*T`，指向一个 `T` 的零值。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+p := new(int)
+fmt.Printf("%T %d\n", p, *p) // *int 0
+```
 
-- `new` 只保证拿到一个被清零的 T 值地址，不负责构造内部运行时结构。
-- map 需要初始化哈希表，channel 需要初始化队列和等待队列，slice 可能需要底层数组。
-- `make([]T, n)` 会创建长度为 n 的切片，元素已经存在且为零值。
-- `make([]T, 0, n)` 创建长度为 0、容量为 n 的切片，更适合逐步 append。
+如果 `T` 是 map 或 channel，零值就是 nil。`new` 不会把它们变成可写 map 或可通信 channel。
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+```go
+pm := new(map[string]int)
+pc := new(chan int)
 
-### 2. 这个知识点在真实项目里怎么取舍？
+fmt.Println(*pm == nil) // true
+fmt.Println(*pc == nil) // true
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+map 和 channel 要用 `make` 初始化运行时结构：
 
-- 需要指针且零值可用时，用 `new` 或 `&T{}` 都可以，实际更常见是 `&T{}`。
-- 创建 map、channel 时用 make，并尽量根据规模给 map 或 slice 容量提示。
-- 区分“预先有 n 个元素”和“预计追加 n 个元素”，分别选择 len=n 或 len=0 cap=n。
-- 结构体初始化优先用复合字面量表达字段含义。
+```go
+m := make(map[string]int)
+ch := make(chan int)
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. 为什么 `new(map[string]int)` 后写入仍然 panic？
 
-### 3. 这道题最容易追问哪些坑？
+因为你拿到的是“指向 nil map 的指针”，不是“指向已初始化 map 的指针”。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+p := new(map[string]int)
+(*p)["go"] = 1 // panic
+```
 
-- 写 `p := new(map[string]int)` 后直接 `(*p)[k] = v`，仍然会 panic。
-- 把 `make([]int, n)` 当成空切片再 append，得到前 n 个零值。
-- 给 channel 使用过大的缓冲，掩盖消费慢的问题。
-- 把 new 和 make 理解成栈分配与堆分配的区别，实际是否上堆由逃逸分析决定。
+等价于：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+var m map[string]int
+p := &m
+(*p)["go"] = 1 // 仍然是 nil map 写入
+```
 
-### 4. 如何证明你的判断是对的？
+正确写法：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+m := make(map[string]int)
+m["go"] = 1
+```
 
-- 用 `fmt.Printf("%T")` 看 new 和 make 的返回类型。
-- 写测试覆盖 nil map 写入 panic、nil channel select 阻塞等边界。
-- 用 `go build -gcflags=-m` 看对象是否逃逸，而不是根据 new/make 猜测。
+面试里可以补一句：map 本身已经是一个描述符，很多场景不需要再取 `*map`。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+## 3. `make([]int, 3)` 和 `make([]int, 0, 3)` 的区别是什么？
 
-### 5. 当规模变大后，这个问题会如何升级？
+`make([]int, 3)` 表示切片长度是 3，已经有 3 个元素。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+s := make([]int, 3)
+fmt.Println(s)      // [0 0 0]
+fmt.Println(len(s)) // 3
 
-- 初始化小对象时选择可读性最好的写法。
-- 大 slice、map 需要合理容量提示，减少扩容和 rehash。
-- 并发系统里 channel 缓冲大小会影响背压、延迟和内存占用。
+s = append(s, 9)
+fmt.Println(s) // [0 0 0 9]
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+`make([]int, 0, 3)` 表示当前长度是 0，只是预留容量 3。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```go
+s := make([]int, 0, 3)
+fmt.Println(s)      // []
+fmt.Println(len(s)) // 0
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+s = append(s, 9)
+fmt.Println(s) // [9]
+```
+
+如果后面用下标赋值，用 `len=n`：
+
+```go
+out := make([]int, len(in))
+for i, v := range in {
+	out[i] = v * 2
+}
+```
+
+如果后面用 append 收集，用 `len=0, cap=n`：
+
+```go
+out := make([]int, 0, len(in))
+for _, v := range in {
+	if v > 0 {
+		out = append(out, v)
+	}
+}
+```
+
+## 4. `make(map[K]V, n)` 的 `n` 是长度还是容量？
+
+是容量提示，不是长度，也不是上限。
+
+```go
+m := make(map[string]int, 2)
+fmt.Println(len(m)) // 0
+
+m["a"] = 1
+m["b"] = 2
+m["c"] = 3 // 可以继续写
+```
+
+给容量提示的意义是减少增长过程中的扩容和 rehash。它不会限制 map 只能放 `n` 个元素。
+
+如果你知道大概要放多少元素，可以给提示：
+
+```go
+m := make(map[int]User, len(users))
+for _, u := range users {
+	m[u.ID] = u
+}
+```
+
+如果只是几个元素，直接字面量更清楚：
+
+```go
+m := map[string]int{
+	"go":  1,
+	"sql": 2,
+}
+```
+
+## 5. channel 缓冲大小应该怎么考虑？
+
+无缓冲 channel 用来同步交接：
+
+```go
+ch := make(chan int)
+```
+
+发送方会等接收方准备好。它能提供天然背压。
+
+有缓冲 channel 用来吸收短时间的生产消费速率差：
+
+```go
+ch := make(chan int, 100)
+```
+
+但缓冲不是越大越好。缓冲过大时，消费者变慢不会立刻暴露，队列里的任务会堆积，延迟和内存都会上升。
+
+```go
+func submit(ch chan<- Job, job Job) error {
+	select {
+	case ch <- job:
+		return nil
+	default:
+		return fmt.Errorf("queue full")
+	}
+}
+```
+
+如果业务不能无限排队，就应该让缓冲满这个状态显式暴露出来，而不是盲目加大 channel。
+
+## 6. `new` 和 `make` 是否决定对象在栈上还是堆上？
+
+不决定。栈还是堆由逃逸分析决定。
+
+```go
+func heap() *int {
+	x := 1
+	return &x
+}
+
+func maybeStack() int {
+	p := new(int)
+	*p = 1
+	return *p
+}
+```
+
+第一个函数返回局部变量地址，`x` 必须在函数返回后仍然有效，所以会逃逸。第二个函数虽然用了 `new`，但如果编译器能证明指针不逃逸，就可能不产生真实堆分配。
+
+验证命令：
+
+```sh
+go build -gcflags=-m ./...
+```
+
+回答这题时不要把 `new` 说成“堆分配”，那是常见误区。

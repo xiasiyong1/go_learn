@@ -6,50 +6,192 @@ Go 中 slice 排序、map 稳定输出和自定义比较应该怎么做？
 
 ## 先给结论
 
-slice 可以排序，map 遍历顺序不稳定。需要稳定输出时，通常先取出 map keys 排序，再按顺序访问。自定义比较函数必须满足一致性，否则排序结果不可预期。
+slice 可以原地排序，map 不能直接排序，因为 map 遍历顺序不稳定。需要稳定输出时，先取出 key 排序，再按 key 访问 map。自定义比较函数必须满足一致性：相等时返回 0 或 false，不能写成“<=”这种会破坏排序约定的逻辑。
 
-## 深入理解
+## 1. 排序会修改原 slice
 
-### 1. 这道题真正考察什么
+```go
+nums := []int{3, 1, 2}
+slices.Sort(nums)
 
-- 是否知道 map 不能直接排序。
-- 是否知道排序会原地修改 slice。
-- 是否能解释 less 函数必须形成稳定的弱序关系。
-- 是否知道稳定排序和不稳定排序的区别。
+fmt.Println(nums) // [1 2 3]
+```
 
-### 2. 底层机制要讲清楚
+如果调用方还需要原顺序，先复制。
 
-- 排序算法会反复调用比较函数决定元素顺序。
-- 普通排序不保证相等元素保持原相对顺序，稳定排序才保证。
-- map 的无序性来自语言不承诺遍历顺序，不能用排序函数直接作用于 map。
-- Go 新版本提供 slices、maps 等包减少样板代码。
+```go
+nums := []int{3, 1, 2}
+sorted := slices.Clone(nums)
+slices.Sort(sorted)
 
-### 3. 工程实践怎么取舍
+fmt.Println(nums)   // [3 1 2]
+fmt.Println(sorted) // [1 2 3]
+```
 
-- 对 slice 排序前确认调用方是否允许原地修改。
-- 需要保留原顺序时先复制再排序。
-- map 输出、签名、缓存 key 和测试结果必须显式排序。
-- 比较函数中处理相等值，避免不稳定或不传递的比较逻辑。
+面试时要主动说：排序通常是原地操作，是否能改原 slice 是 API 设计的一部分。
 
-### 4. 常见误区
+## 2. 自定义排序
 
-- 排序函数修改了原 slice，影响调用方后续逻辑。
-- 比较函数写成 `<=`，破坏排序约定。
-- 测试依赖 map 遍历顺序。
-- 按字符串排序数字，得到 `10` 小于 `2` 的结果。
+按年龄排序：
 
-## 如何验证理解
+```go
+type User struct {
+	Name string
+	Age  int
+}
 
-- 写测试覆盖空 slice、重复元素和相等字段。
-- 对 map 输出测试固定排序后的结果。
-- 用 fuzz 或随机数据检查比较函数是否稳定工作。
+users := []User{
+	{Name: "a", Age: 20},
+	{Name: "b", Age: 18},
+}
+
+slices.SortFunc(users, func(a, b User) int {
+	return cmp.Compare(a.Age, b.Age)
+})
+```
+
+多字段排序：
+
+```go
+slices.SortFunc(users, func(a, b User) int {
+	if n := cmp.Compare(a.Age, b.Age); n != 0 {
+		return n
+	}
+	return cmp.Compare(a.Name, b.Name)
+})
+```
+
+如果使用旧版本 Go，也可以用 `sort.Slice`：
+
+```go
+sort.Slice(users, func(i, j int) bool {
+	return users[i].Age < users[j].Age
+})
+```
+
+## 3. 比较函数不能写错
+
+错误写法：
+
+```go
+sort.Slice(nums, func(i, j int) bool {
+	return nums[i] <= nums[j] // 错：相等时也返回 true
+})
+```
+
+比较函数应表达严格小于。
+
+```go
+sort.Slice(nums, func(i, j int) bool {
+	return nums[i] < nums[j]
+})
+```
+
+对 `slices.SortFunc`，相等时应该返回 0。
+
+```go
+slices.SortFunc(users, func(a, b User) int {
+	return cmp.Compare(a.Age, b.Age)
+})
+```
+
+比较逻辑不一致时，排序结果不可预期。
+
+## 4. 稳定排序和不稳定排序
+
+普通排序不保证相等元素保持原相对顺序。稳定排序会保留相等元素的原顺序。
+
+```go
+type Item struct {
+	Group string
+	Name  string
+}
+
+items := []Item{
+	{Group: "a", Name: "first"},
+	{Group: "a", Name: "second"},
+}
+
+sort.SliceStable(items, func(i, j int) bool {
+	return items[i].Group < items[j].Group
+})
+```
+
+如果相同 Group 内的原顺序有业务意义，用稳定排序。
+
+## 5. map 要稳定输出，先排序 key
+
+不要依赖 map 遍历顺序。
+
+```go
+m := map[string]int{
+	"b": 2,
+	"a": 1,
+	"c": 3,
+}
+
+for k, v := range m {
+	fmt.Println(k, v) // 顺序不保证
+}
+```
+
+稳定输出：
+
+```go
+keys := make([]string, 0, len(m))
+for k := range m {
+	keys = append(keys, k)
+}
+slices.Sort(keys)
+
+for _, k := range keys {
+	fmt.Println(k, m[k])
+}
+```
+
+这在测试、签名、缓存 key、配置输出里非常重要。
+
+## 6. 数字字符串排序要注意语义
+
+字符串排序是字典序：
+
+```go
+s := []string{"2", "10", "1"}
+slices.Sort(s)
+fmt.Println(s) // [1 10 2]
+```
+
+如果业务要按数字排序，就转换成数字比较。
+
+```go
+slices.SortFunc(s, func(a, b string) int {
+	ai, _ := strconv.Atoi(a)
+	bi, _ := strconv.Atoi(b)
+	return cmp.Compare(ai, bi)
+})
+
+fmt.Println(s) // [1 2 10]
+```
+
+真实代码里要处理转换错误，不要像示例里忽略。
+
+## 7. 面试时怎么答
+
+可以这样回答：
+
+- slice 排序通常原地修改，保留原顺序要先复制。
+- 基础类型可用 `slices.Sort`，结构体用 `slices.SortFunc` 或 `sort.Slice`。
+- 比较函数必须一致，相等时不能返回“小于”。
+- 需要保留相等元素原顺序时用稳定排序。
+- map 遍历顺序不稳定，稳定输出要先取 key、排序、再访问 map。
+- 字符串排序和数字排序语义不同。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“排序”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- 为什么排序前有时要先复制 slice？
+- `sort.Slice` 的 less 函数为什么不能写 `<=`？
+- 稳定排序解决什么问题？
+- map 为什么不能直接排序？
+- 排序 map 输出时有哪些性能和正确性取舍？

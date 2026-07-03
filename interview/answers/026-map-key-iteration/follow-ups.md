@@ -1,60 +1,169 @@
 # 026. map key 和遍历顺序 - 面试追问
 
-## 追问与参考答案
+## 1. map key 为什么必须可比较？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+map 需要用 key 做哈希和相等判断。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+m := map[string]int{}
+m["go"] = 1
+fmt.Println(m["go"])
+```
 
-- map 查找先根据 key 计算哈希定位桶，再用相等判断确认 key。
-- 不可比较类型没有语言定义的相等关系，无法作为 key。
-- map 内部会因为扩容、哈希种子、插入删除等因素改变遍历顺序。
-- Go 故意不承诺遍历顺序，避免代码依赖运行时实现细节。
+查找 `"go"` 时，运行时要先用它计算哈希，再判断 bucket 里某个 key 是否等于 `"go"`。
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+slice、map、func 没有语言定义的通用相等关系，所以不能作为 key：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+// map[[]int]string{} // 编译错误
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+## 2. 结构体什么时候能做 map key？
 
-- 需要复合 key 时，用字段都可比较的结构体。
-- 需要 slice 内容作 key 时，转换成稳定字符串、数组或自定义哈希 key。
-- 需要稳定输出时，收集 key 到 slice，排序后再访问 map。
-- 不要把 map 遍历顺序用于分页、签名、哈希或测试期望。
+所有字段都可比较时，结构体可以做 key。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+type Key struct {
+	TenantID int64
+	UserID   int64
+}
 
-### 3. 这道题最容易追问哪些坑？
+m := map[Key]string{}
+m[Key{1, 2}] = "Tom"
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+如果加了不可比较字段，就不行：
 
-- 测试中直接比较 map 遍历输出字符串，导致偶发失败。
-- 结构体 key 中包含指针，比较的是地址不是指向内容。
-- 把可变对象编码后作为 key，却没有保证编码规范化。
-- 并发读写 map 时谈顺序没有意义，先解决并发安全。
+```go
+type BadKey struct {
+	TenantID int64
+	UserID   int64
+	Tags     []string
+}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+// map[BadKey]string{} // 编译错误
+```
 
-### 4. 如何证明你的判断是对的？
+公共 key 类型新增字段要谨慎，因为这可能破坏调用方编译。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+## 3. `[]byte` 内容想做 key，有哪些方案？
 
-- 多次运行同一 map 遍历程序，观察顺序变化。
-- 为需要稳定输出的函数写测试，断言排序后的结果。
-- 用编译检查验证结构体 key 是否仍然可比较。
+常见方案一：转 string。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+m := map[string]int{}
+b := []byte("hello")
+m[string(b)]++
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+优点是简单；缺点是可能有转换成本。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+方案二：固定长度用数组。
 
-- 少量内部临时代码可以不关心顺序。
-- 对外输出、签名、缓存 key 和测试结果必须显式排序或规范化。
-- 大 map 排序会带来 O(n log n) 成本，需要结合调用频率评估。
+```go
+var key [32]byte
+copy(key[:], sum)
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+m := map[[32]byte]int{}
+m[key]++
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+方案三：多个字段用结构体。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+type Key struct {
+	Method string
+	Path   string
+}
+```
+
+不要用不规范拼接制造冲突：
+
+```go
+key := a + ":" + b
+```
+
+如果 `a` 或 `b` 本身包含 `:`，就可能产生歧义。
+
+## 4. 指针做 key 时比较的是地址还是内容？
+
+比较的是地址。
+
+```go
+a := &User{ID: 1}
+b := &User{ID: 1}
+
+m := map[*User]string{
+	a: "first",
+	b: "second",
+}
+
+fmt.Println(len(m)) // 2
+```
+
+如果业务上只看 `ID`，就用 `ID` 做 key：
+
+```go
+m := map[int64]string{}
+m[a.ID] = "first"
+m[b.ID] = "second"
+
+fmt.Println(len(m)) // 1
+```
+
+指针 key 适合表达对象身份，不适合表达内容相等。
+
+## 5. map 遍历顺序为什么不能用于稳定输出？
+
+语言不保证 map 遍历顺序。
+
+```go
+for k, v := range m {
+	fmt.Println(k, v)
+}
+```
+
+这段代码的输出顺序不能作为测试期望、签名输入或分页依据。
+
+稳定输出要排序：
+
+```go
+keys := make([]string, 0, len(m))
+for k := range m {
+	keys = append(keys, k)
+}
+sort.Strings(keys)
+
+for _, k := range keys {
+	fmt.Println(k, m[k])
+}
+```
+
+## 6. 需要稳定 JSON、签名或测试输出时应该怎么做？
+
+核心是先定义顺序。
+
+签名：
+
+```go
+func Canonical(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(m[k])
+		b.WriteByte('&')
+	}
+	return b.String()
+}
+```
+
+测试输出也一样，不要直接比较 range map 拼出来的字符串。先排序，再断言结果。
+
+如果 map 很大，排序是 `O(n log n)`，要结合调用频率评估成本；但正确性上必须先稳定顺序。

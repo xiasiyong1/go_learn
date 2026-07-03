@@ -1,60 +1,213 @@
 # 014. 指针基础 - 面试追问
 
-## 追问与参考答案
+## 1. Go 指针和 C 指针最大的区别是什么？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+Go 指针可以取地址和解引用，但不能做普通指针运算。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+n := 10
+p := &n
 
-- 指针保存变量地址，多个指针可以指向同一个对象，因此会引入共享可变状态。
-- GC 需要准确知道对象引用关系，任意指针运算会破坏安全边界。
-- 传指针减少值拷贝，但可能让对象逃逸到堆上，增加 GC 成本。
-- 值传递复制的是值本身；如果值里有 slice、map、指针字段，内部数据仍可能共享。
+fmt.Println(*p) // 10
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+// p++     // 编译错误
+// p = p+1 // 编译错误
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+不能做指针运算的好处是：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+- 不能随便越界访问内存。
+- 不能通过地址运算伪造对象。
+- GC 可以准确追踪对象引用。
+- 普通业务代码更少接触野指针、悬垂指针问题。
 
-- 需要修改调用方对象、对象较大、方法要保持一致性时用指针。
-- 小的不可变值、时间值、坐标值等可以传值，语义更清晰。
-- 包含 `sync.Mutex` 等不可复制字段的结构体，不要在使用后复制。
-- 对外 API 不要为了“可能更快”到处暴露指针，先表达清楚所有权和可变性。
+如果需要连续访问数据，用切片和索引：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+xs := []int{1, 2, 3}
+fmt.Println(xs[1])
+```
 
-### 3. 这道题最容易追问哪些坑？
+`unsafe.Pointer` 可以绕过这些限制，但那是显式放弃部分安全性，应该单独说明边界。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. nil 指针作为参数时应该怎么设计 API？
 
-- 以为传指针一定更快，忽略逃逸和缓存局部性。
-- 值拷贝含锁结构体，导致锁保护失效。
-- 把 nil 指针作为正常值传递，却没有在方法里定义行为。
-- 误以为不能返回局部变量地址。
+先决定 nil 是否是合法输入。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+如果 nil 有业务含义，方法里要明确处理：
 
-### 4. 如何证明你的判断是对的？
+```go
+func DisplayName(u *User) string {
+	if u == nil {
+		return "<guest>"
+	}
+	return u.Name
+}
+```
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+如果 nil 不合法，尽早返回错误：
 
-- 用 benchmark 比较小值、大值、指针传递的实际表现。
-- 用 `-gcflags=-m` 查看是否逃逸到堆。
-- 用 `go vet -copylocks` 检查复制锁的问题。
+```go
+func NewHandler(store *Store) (*Handler, error) {
+	if store == nil {
+		return nil, fmt.Errorf("store is nil")
+	}
+	return &Handler{store: store}, nil
+}
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+不推荐既不检查，也不说明：
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+func DisplayName(u *User) string {
+	return u.Name // u 为 nil 时 panic
+}
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+除非这是内部函数，并且调用约束非常明确，否则这种 API 对初学者和调用方都不友好。
 
-- 小项目中传值或传指针主要影响可读性。
-- 高性能场景要结合逃逸、分配和缓存行为做判断。
-- 团队 API 设计里，指针参数往往意味着函数可能修改对象，需要保持一致约定。
+## 3. 为什么 Go 可以返回局部变量地址？
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+因为编译器会做逃逸分析。局部变量如果在函数返回后仍然被引用，就不会放在会失效的位置。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```go
+func NewUser(name string) *User {
+	u := User{Name: name}
+	return &u
+}
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+这在 Go 中是安全的。编译器会保证 `u` 在函数返回后仍然有效，通常会让它逃逸到堆上。
+
+可以用命令看逃逸信息：
+
+```sh
+go build -gcflags=-m ./...
+```
+
+面试里不要说“返回局部变量地址会悬垂”。这是把其他语言经验错误套到 Go。
+
+## 4. 传指针一定比传值快吗？
+
+不一定。
+
+传指针减少了值复制，但可能让对象逃逸到堆上，也会引入共享可变状态。
+
+```go
+type Point struct {
+	X, Y int
+}
+
+func Distance(p Point) int {
+	return p.X*p.X + p.Y*p.Y
+}
+```
+
+这种小结构体传值通常很自然。
+
+较大的对象或需要修改原对象时才更适合指针：
+
+```go
+type Buffer struct {
+	data [4096]byte
+	n    int
+}
+
+func Reset(b *Buffer) {
+	b.n = 0
+}
+```
+
+性能判断要靠数据：
+
+```sh
+go test -bench . -benchmem
+go build -gcflags=-m ./...
+```
+
+更稳的回答是：先按语义选择，性能敏感时再验证。
+
+## 5. 值拷贝里有 slice/map 字段时，底层数据会不会共享？
+
+会共享。
+
+```go
+type Config struct {
+	Tags []string
+	Meta map[string]string
+}
+
+a := Config{
+	Tags: []string{"go"},
+	Meta: map[string]string{"env": "dev"},
+}
+b := a
+
+b.Tags[0] = "java"
+b.Meta["env"] = "prod"
+
+fmt.Println(a.Tags[0])    // java
+fmt.Println(a.Meta["env"]) // prod
+```
+
+结构体是值拷贝，但 slice 和 map 字段本身是描述符，描述符指向的底层数据仍然是同一份。
+
+需要深拷贝时要手动复制：
+
+```go
+func CloneConfig(c Config) Config {
+	tags := append([]string(nil), c.Tags...)
+
+	meta := make(map[string]string, len(c.Meta))
+	for k, v := range c.Meta {
+		meta[k] = v
+	}
+
+	return Config{Tags: tags, Meta: meta}
+}
+```
+
+## 6. 为什么含 `sync.Mutex` 的结构体使用后不能复制？
+
+因为复制后会得到另一个锁状态和另一份字段，锁保护关系被破坏。
+
+```go
+type Counter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func Bad(c Counter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+`Bad` 复制了 `Counter`，它锁住的是副本，不是原对象。
+
+正确写法：
+
+```go
+func Good(c *Counter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+方法接收者也一样，含锁类型通常用指针接收者：
+
+```go
+func (c *Counter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+可以用 `go vet` 辅助检查：
+
+```sh
+go vet -copylocks ./...
+```

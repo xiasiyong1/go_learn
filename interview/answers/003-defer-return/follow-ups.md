@@ -1,60 +1,302 @@
 # 003. defer、return 和具名返回值 - 面试追问
 
-## 追问与参考答案
+## 1. `return expr` 和 `defer` 的精确执行顺序是什么？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+可以记成四步：
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+1. 计算 `expr`。
+2. 把 `expr` 的值赋给返回值。
+3. 执行 `defer`。
+4. 函数返回。
 
-- `return expr` 大致分两步：先把 `expr` 赋给返回值，再执行 defer，最后返回给调用方。
-- 具名返回值在函数作用域内是真实变量，defer 闭包捕获它后可以在返回前修改。
-- defer 注册时会保存函数和实参；闭包捕获变量时保存的是变量引用语义，需要看捕获对象是否后续变化。
-- 现代 Go 对很多 defer 做了优化，但在极热循环里仍应该关注成本和释放时机。
+用代码推演最清楚：
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+```go
+package main
 
-### 2. 这个知识点在真实项目里怎么取舍？
+import "fmt"
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+func f() (n int) {
+	defer func() {
+		fmt.Println("defer before:", n)
+		n += 10
+		fmt.Println("defer after:", n)
+	}()
 
-- 资源配对释放，如文件、锁、临时状态恢复，优先用 defer 提高可读性。
-- 循环内每次迭代都需要及时释放资源时，不要把 defer 放在长生命周期函数的循环体里。
-- 需要包装错误时，具名返回值加 defer 可以使用，但要保持逻辑简单。
-- 持锁时间敏感时，可以显式 Unlock，或者把临界区拆成小函数再使用 defer。
+	fmt.Println("return expression")
+	return 1
+}
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+func main() {
+	fmt.Println("result:", f())
+}
+```
 
-### 3. 这道题最容易追问哪些坑？
+输出：
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```text
+return expression
+defer before: 1
+defer after: 11
+result: 11
+```
 
-- 以为 `defer f(x)` 的 `x` 会在执行 defer 时才计算。
-- 具名返回值中在 defer 覆盖错误，导致真正失败原因丢失。
-- 循环里 defer 关闭大量文件，直到函数退出才关闭，造成 fd 耗尽。
-- 用 defer 解锁但临界区过大，隐藏了性能问题。
+`defer before` 看到的是 `1`，说明 `return 1` 已经先把 `1` 赋给了返回值；最终结果是 `11`，说明 `defer` 在真正返回前还能修改具名返回值。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+## 2. `defer f(x)` 和 `defer func(){ f(x) }()` 为什么输出可能不同？
 
-### 4. 如何证明你的判断是对的？
+因为 `defer f(x)` 的参数在注册 `defer` 时求值；闭包里的 `x` 则在闭包执行时读取。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+package main
 
-- 写小函数分别测试匿名返回值、具名返回值、defer 参数和 defer 闭包的输出。
-- 用 `go test -run` 固定这些边界行为，避免凭记忆判断。
-- 用 benchmark 判断热点路径 defer 是否真的成为瓶颈。
+import "fmt"
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+func print(label string, n int) {
+	fmt.Println(label, n)
+}
 
-### 5. 当规模变大后，这个问题会如何升级？
+func main() {
+	x := 1
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+	defer print("argument:", x)
+	defer func() {
+		print("closure:", x)
+	}()
 
-- 普通业务代码中 defer 的可读性收益通常大于微小成本。
-- 资源数量和并发量很大时，defer 的释放时机比语法便利更重要。
-- 公共库中涉及错误包装时，defer 对返回值的修改要非常克制，避免调用者难以理解。
+	x = 2
+}
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+输出：
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```text
+closure: 2
+argument: 1
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+第二个 `defer` 后注册，所以先执行。它是闭包，执行时读取到 `x == 2`。第一个 `defer` 在注册时已经把参数保存成 `1`。
+
+如果想让闭包也固定住注册时的值，把值作为参数传进去：
+
+```go
+func main() {
+	x := 1
+	defer func(v int) {
+		fmt.Println(v)
+	}(x)
+
+	x = 2
+}
+```
+
+这里输出 `1`。
+
+## 3. 为什么具名返回值可以被 `defer` 修改，匿名返回值通常不行？
+
+具名返回值是函数内可见的变量：
+
+```go
+func named() (n int) {
+	defer func() {
+		n *= 2
+	}()
+	return 5
+}
+```
+
+它大致等价于：
+
+```go
+func named() (n int) {
+	n = 5
+	func() {
+		n *= 2
+	}()
+	return
+}
+```
+
+所以返回 `10`。
+
+匿名返回值没有一个可以被 `defer` 按名字访问的返回变量。下面的 `defer` 改的是局部变量 `n`：
+
+```go
+func unnamed() int {
+	n := 5
+	defer func() {
+		n *= 2
+	}()
+	return n
+}
+```
+
+它大致等价于：
+
+```go
+func unnamed() int {
+	n := 5
+	ret := n
+	func() {
+		n *= 2
+	}()
+	return ret
+}
+```
+
+所以返回 `5`。
+
+## 4. 循环中使用 `defer` 关闭资源有什么风险？
+
+风险是资源释放延后到整个函数结束，而不是本次循环结束。
+
+错误示例：
+
+```go
+func CountLines(paths []string) (int, error) {
+	total := 0
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			return 0, err
+		}
+		defer f.Close()
+
+		n, err := countLines(f)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+```
+
+如果路径很多，文件会一直开着，直到 `CountLines` 返回。
+
+推荐把单次处理拆成函数：
+
+```go
+func CountLines(paths []string) (int, error) {
+	total := 0
+	for _, path := range paths {
+		n, err := countOne(path)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func countOne(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	return countLines(f)
+}
+```
+
+这样每次 `countOne` 返回时都会关闭对应文件。
+
+## 5. `defer` 解锁什么时候合适，什么时候应该显式解锁？
+
+短临界区、函数逻辑简单时，`defer` 解锁非常合适：
+
+```go
+func (s *Store) Get(key string) (int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	v, ok := s.m[key]
+	return v, ok
+}
+```
+
+它能避免多个 `return` 分支忘记解锁。
+
+但如果锁只需要保护一小段代码，后面还有慢操作，就应该缩短持锁时间：
+
+```go
+func (s *Store) Send(key string) error {
+	s.mu.RLock()
+	value, ok := s.m[key]
+	s.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("missing key %s", key)
+	}
+	return sendToRemote(value)
+}
+```
+
+不要写成：
+
+```go
+func (s *Store) BadSend(key string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	value, ok := s.m[key]
+	if !ok {
+		return fmt.Errorf("missing key %s", key)
+	}
+	return sendToRemote(value) // 持锁期间做远程调用
+}
+```
+
+这里的问题不是 `defer` 本身，而是临界区设计太大。
+
+## 6. `defer`、`panic`、`recover` 三者之间是什么关系？
+
+发生 `panic` 后，当前 goroutine 会开始退出当前函数，并执行已经注册的 `defer`。`recover` 只有在 `defer` 函数中直接调用时，才能捕获这个 panic。
+
+```go
+package main
+
+import "fmt"
+
+func safeRun() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("recovered:", r)
+		}
+	}()
+
+	panic("boom")
+}
+
+func main() {
+	safeRun()
+	fmt.Println("continue")
+}
+```
+
+输出：
+
+```text
+recovered: boom
+continue
+```
+
+常见错误是把 `recover` 放在普通函数里，然后从 `defer` 调用这个普通函数的外层。下面这样不能恢复 panic：
+
+```go
+func badRecover() {
+	if r := recover(); r != nil {
+		fmt.Println(r)
+	}
+}
+
+func run() {
+	defer func() {
+		badRecover() // recover 没有在 defer 函数中直接调用
+	}()
+	panic("boom")
+}
+```
+
+实际工程里不要用 `recover` 掩盖普通错误。它更适合在 goroutine 边界、框架入口、任务调度器入口做兜底，防止单个任务把整个进程打崩。

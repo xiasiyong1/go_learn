@@ -1,60 +1,136 @@
 # 072. I/O - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 Reader 要返回 `(n int, err error)` 两个值？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为一次读取可能只读到部分数据，也可能在读到部分数据的同时遇到错误或 EOF。`n` 告诉你本次 buffer 中有多少字节有效，`err` 告诉你读取状态。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+buf := make([]byte, 4)
+n, err := r.Read(buf)
 
-- Reader 把数据读入调用方提供的 buffer，避免接口强制分配。
-- Read 可以返回部分数据和一个错误，调用方必须先处理 n 再处理 err。
-- EOF 表示没有更多数据，通常在已经读完所有数据后返回。
-- 大量标准库函数围绕 Reader/Writer 组合，例如文件、网络连接、压缩、编码。
+if n > 0 {
+	fmt.Printf("valid data: %q\n", buf[:n])
+}
+if err != nil {
+	fmt.Println("read status:", err)
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+如果只返回 error，就无法表达“读到了一部分，但后面结束了”。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+## 2. 为什么读取循环要先处理 `n` 再处理 `err`？
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+因为 `n > 0` 和 `err != nil` 可以同时成立。先 return err 可能丢数据。
 
-- 流式处理大文件或网络响应，不要一次性全部读入内存。
-- 读取循环里先消费 n 个字节，再判断 err。
-- 正常读到 EOF 不应记录为错误日志。
-- 需要复制流时使用 `io.Copy`，不要手写低质量循环。
+错误写法：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+for {
+	n, err := r.Read(buf)
+	if err != nil {
+		return err
+	}
+	process(buf[:n])
+}
+```
 
-### 3. 这道题最容易追问哪些坑？
+正确写法：
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+for {
+	n, err := r.Read(buf)
+	if n > 0 {
+		process(buf[:n])
+	}
+	if err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+}
+```
 
-- 看到 err 非 nil 就直接 return，丢掉本次已经读取的 n 字节。
-- 把 EOF 当异常错误上报。
-- 对大文件使用 `io.ReadAll` 导致内存峰值过高。
-- 复用 buffer 后把切片长期保存，内容被下一次读取覆盖。
+这是 Reader 语义里最容易被问深的点。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+## 3. `io.EOF` 和 `io.ErrUnexpectedEOF` 有什么区别？
 
-### 4. 如何证明你的判断是对的？
+`io.EOF` 表示正常读到流末尾。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+r := strings.NewReader("abc")
+data, err := io.ReadAll(r)
+fmt.Println(string(data), err) // abc <nil>
+```
 
-- 写自定义 Reader 模拟部分读取和 EOF。
-- 用小 buffer 测试读取循环，确保边界正确。
-- 对大输入做内存 benchmark，比较流式和 ReadAll。
+很多高级函数会把最终 EOF 处理掉，返回 nil。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+`io.ErrUnexpectedEOF` 表示还没读到预期长度，流就结束了。
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+r := strings.NewReader("abc")
+buf := make([]byte, 5)
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+_, err := io.ReadFull(r, buf)
+fmt.Println(err == io.ErrUnexpectedEOF) // true
+```
 
-- 小文件可以直接 ReadAll。
-- 大文件、网络代理、上传下载场景必须流式处理。
-- I/O 接口设计得好，模块可以自然组合而不互相依赖具体实现。
+协议解析里，头部、长度字段、固定帧没读满，通常就是异常 EOF。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+## 4. `io.ReadAll` 什么时候不合适？
 
-### 6. 初学者应该怎么把这个问题学扎实？
+当输入大小不可控或可能很大时不合适。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+data, err := io.ReadAll(req.Body) // 如果 body 很大，内存会暴涨
+if err != nil {
+	return err
+}
+```
+
+更稳的做法是限制大小：
+
+```go
+limited := io.LimitReader(req.Body, 1<<20) // 1 MiB
+data, err := io.ReadAll(limited)
+```
+
+或直接流式复制：
+
+```go
+_, err := io.Copy(dst, req.Body)
+```
+
+如果是 HTTP 服务，还应配合 `http.MaxBytesReader` 限制请求体。
+
+## 5. 为什么保存 `buf[:n]` 之前经常要复制？
+
+因为 `buf[:n]` 只是复用 buffer 的一个视图，下一次 Read 会覆盖同一个底层数组。
+
+错误示例：
+
+```go
+var chunks [][]byte
+buf := make([]byte, 3)
+
+for {
+	n, err := r.Read(buf)
+	if n > 0 {
+		chunks = append(chunks, buf[:n])
+	}
+	if err == io.EOF {
+		break
+	}
+}
+```
+
+正确写法：
+
+```go
+if n > 0 {
+	chunk := append([]byte(nil), buf[:n]...)
+	chunks = append(chunks, chunk)
+}
+```
+
+判断标准：如果只是立刻处理，可以不复制；如果要存起来、传给异步 goroutine、放进缓存，就要复制。

@@ -6,45 +6,14 @@
 
 ## 先给结论
 
-interface 的 nil 陷阱来自接口值由“动态类型”和“动态值”两部分组成。只有两者都为空时，接口本身才等于 nil。
+接口值不是只保存一个值。可以把它理解成两部分：
 
-## 深入理解
+- 动态类型。
+- 动态值。
 
-### 1. 这道题真正考察什么
+只有动态类型和动态值都为空时，接口值才等于 `nil`。如果接口里装的是一个“类型为 `*T`、值为 `nil` 的指针”，那么接口的动态类型不为空，所以接口本身不等于 `nil`。
 
-- 是否能区分接口变量本身为 nil 和接口里装了一个 nil 指针。
-- 是否知道 `var e error = (*MyErr)(nil)` 时 `e != nil`。
-- 是否能解释这个问题为什么常出现在 error 返回值里。
-- 是否知道如何设计函数避免把 nil 具体指针装进接口返回。
-
-### 2. 底层机制要讲清楚
-
-- 空接口可以近似理解为 `(type, value)`；非空接口还涉及接口表和方法集。
-- 当动态类型是 `*T`、动态值是 nil 时，接口的类型部分非空，所以接口值不等于 nil。
-- 接口调用方法时会依据动态类型做分派；如果方法内部解引用 nil 接收者，仍可能 panic。
-- 类型断言检查的是接口中的动态类型，不是变量声明时的静态类型。
-
-### 3. 工程实践怎么取舍
-
-- 返回 `error` 时，如果没有错误直接返回字面量 `nil`，不要返回一个类型为 `*MyErr` 的 nil 变量。
-- 接口入参里需要判断 nil 时，先判断接口本身，再根据需要用反射或类型断言处理底层 nil。
-- 给接口设计方法时，明确 nil receiver 是否是合法状态。
-- 尽量让函数返回具体类型或接口之一，不要在同一层来回装箱拆箱。
-
-### 4. 常见误区
-
-- 用 `if err != nil` 判断后发现明明没有错误却进入错误分支。
-- 以为接口保存的是“对象本身”，忽略动态类型也参与 nil 判断。
-- 用反射判断 nil 时，没有先处理非可 nil 类型导致 panic。
-- 在接口里放入 nil slice、nil map、nil func 后误判接口为 nil。
-
-## 如何验证理解
-
-- 写表格测试覆盖 nil 接口、nil 指针装接口、nil slice 装接口等场景。
-- 用 `%T` 和 `%#v` 打印动态类型和值，辅助理解接口内容。
-- 对 error 返回路径增加测试，确认无错误时返回的确实是 nil 接口。
-
-## 代码示例
+最经典的例子是：
 
 ```go
 package main
@@ -58,36 +27,229 @@ func (e *MyError) Error() string {
 }
 
 func returnsError() error {
-	var err *MyError
+	var err *MyError = nil
 	return err
 }
 
 func main() {
 	err := returnsError()
 	fmt.Println(err == nil) // false
+	fmt.Printf("%T %#v\n", err, err)
 }
 ```
 
-## 避免方式
+`returnsError` 返回的不是一个 nil 接口，而是一个动态类型为 `*MyError`、动态值为 `nil` 的 `error` 接口。
 
-如果没有错误，直接返回接口类型的 nil：
+## 三种 nil 要分清楚
+
+### 1. nil 接口
 
 ```go
-func returnsError() error {
-	var err *MyError
-	if err == nil {
-		return nil
-	}
-	return err
+var v any
+fmt.Println(v == nil) // true
+```
+
+此时接口没有动态类型，也没有动态值。
+
+### 2. nil 指针装进接口
+
+```go
+var p *int = nil
+var v any = p
+
+fmt.Println(p == nil) // true
+fmt.Println(v == nil) // false
+fmt.Printf("%T %#v\n", v, v) // *int (*int)(nil)
+```
+
+`p` 是 nil 指针，但 `v` 是一个非 nil 接口，因为它记住了动态类型 `*int`。
+
+### 3. nil slice 装进接口
+
+```go
+var s []int = nil
+var v any = s
+
+fmt.Println(s == nil) // true
+fmt.Println(v == nil) // false
+fmt.Printf("%T %#v\n", v, v) // []int []int(nil)
+```
+
+slice 本身可以是 nil；但它被放入接口后，接口的动态类型是 `[]int`，所以接口不等于 nil。
+
+## 为什么 error 最容易踩坑
+
+`error` 是接口：
+
+```go
+type error interface {
+	Error() string
 }
 ```
+
+如果函数签名返回 `error`，你返回一个 nil 的具体错误指针，就会把“有类型的 nil”装进接口。
+
+错误示例：
+
+```go
+type ParseError struct {
+	Line int
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("parse error at line %d", e.Line)
+}
+
+func Parse(input string) error {
+	var err *ParseError
+	if input == "" {
+		err = &ParseError{Line: 1}
+	}
+	return err // input 非空时，返回的是非 nil error
+}
+```
+
+调用方会误判：
+
+```go
+if err := Parse("ok"); err != nil {
+	// 会进入这里
+	fmt.Println("failed:", err)
+}
+```
+
+正确写法是没有错误就直接返回字面量 `nil`：
+
+```go
+func Parse(input string) error {
+	if input == "" {
+		return &ParseError{Line: 1}
+	}
+	return nil
+}
+```
+
+如果中间确实需要用具体错误变量，也要在返回前判断：
+
+```go
+func Parse(input string) error {
+	var err *ParseError
+	if input == "" {
+		err = &ParseError{Line: 1}
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+```
+
+## 接口方法调用和 nil receiver
+
+接口不为 nil，不代表里面的指针一定不为 nil。
+
+```go
+type User struct {
+	Name string
+}
+
+func (u *User) String() string {
+	return u.Name
+}
+
+func main() {
+	var u *User = nil
+	var s fmt.Stringer = u
+
+	fmt.Println(s == nil) // false
+	fmt.Println(s.String()) // panic: nil pointer dereference
+}
+```
+
+如果你希望 nil receiver 是合法状态，方法内部必须显式处理：
+
+```go
+func (u *User) String() string {
+	if u == nil {
+		return "<nil user>"
+	}
+	return u.Name
+}
+```
+
+这个设计要谨慎。不是所有类型都应该支持 nil receiver；公共 API 要让调用方容易理解。
+
+## 类型断言检查的是动态类型
+
+类型断言看的是接口里的动态类型，不是变量声明时的静态类型。
+
+```go
+var p *ParseError = nil
+var err error = p
+
+pe, ok := err.(*ParseError)
+fmt.Println(ok)       // true
+fmt.Println(pe == nil) // true
+fmt.Println(err == nil) // false
+```
+
+这段代码同时成立：
+
+- `err != nil`，因为接口有动态类型。
+- `pe == nil`，因为断言出来的具体指针值是 nil。
+
+## 用反射判断底层 nil 要小心
+
+有时接口入参是 `any`，你想判断里面是不是 nil 指针、nil slice、nil map 或 nil func。可以用反射，但必须先判断 kind 是否可 nil。
+
+安全写法：
+
+```go
+package nilcheck
+
+import "reflect"
+
+func IsNil(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface,
+		reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+```
+
+错误写法：
+
+```go
+func BadIsNil(v any) bool {
+	return reflect.ValueOf(v).IsNil()
+}
+```
+
+如果传入 `int`、`struct` 这类不可 nil 的值，`IsNil` 会 panic。
+
+## 工程上怎么避免
+
+- 返回 `error` 时，没有错误就返回字面量 `nil`。
+- 不要把 nil 的具体指针直接返回给接口类型。
+- 接口入参如果要判空，先判断接口本身，再判断底层值。
+- 公共 API 要说明 nil receiver、nil slice、nil map 是否是合法输入。
+- 能返回具体类型时不要过早返回接口；接口通常放在使用方一侧更容易控制语义。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“interface nil 陷阱”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- 接口值什么时候才等于 `nil`？
+- 为什么 `var err error = (*MyError)(nil)` 之后 `err != nil`？
+- nil slice 放进 `any` 后，为什么 `anyValue != nil`？
+- 类型断言后得到 nil 指针，为什么断言仍然成功？
+- 用反射判断接口底层 nil 时，为什么可能 panic？
+- 设计返回 `error` 的函数时，如何避免 typed nil？

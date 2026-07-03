@@ -1,60 +1,151 @@
 # 024. 泛型 - 面试追问
 
-## 追问与参考答案
+## 1. 泛型和 `any` 最大区别是什么？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+泛型保留静态类型信息，`any` 会把类型检查推迟到运行时。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+泛型：
 
-- 类型参数让函数或类型在编译期针对不同类型进行检查。
-- 约束接口可以包含方法集，也可以包含类型集合，例如 `~int | ~int64`。
-- `comparable` 约束允许在泛型代码里使用 `==` 和作为 map key。
-- 泛型保留静态类型信息，避免空接口带来的运行时断言和类型错误。
+```go
+func First[T any](items []T) (T, bool) {
+	if len(items) == 0 {
+		var zero T
+		return zero, false
+	}
+	return items[0], true
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+n, _ := First([]int{1, 2})
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+`n` 的类型是 `int`。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+`any`：
 
-- 容器、集合操作、数值算法、通用缓存结构适合泛型。
-- 需要行为抽象和动态派发时，接口仍然更合适。
-- 只有两个类型且逻辑并不复杂时，重复少量代码可能比泛型更清晰。
-- 公共泛型 API 的约束要尽量小，给调用方保留类型空间。
+```go
+func FirstAny(items []any) (any, bool) {
+	if len(items) == 0 {
+		return nil, false
+	}
+	return items[0], true
+}
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+v, _ := FirstAny([]any{1, 2})
+n := v.(int)
+```
 
-### 3. 这道题最容易追问哪些坑？
+需要断言，断言错了会 panic。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. 约束里的 `comparable` 有什么作用？
 
-- 为了展示技巧，把简单业务逻辑写成复杂类型参数。
-- 约束过宽，函数体实际使用了未被约束保证的操作。
-- 约束过窄，导致本可复用的自定义底层类型不能传入。
-- 把泛型当成继承体系使用。
+它允许泛型代码使用 `==`、`!=`，也允许类型作为 map key。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+func Contains[T comparable](items []T, target T) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+```
 
-### 4. 如何证明你的判断是对的？
+如果用 `T any`，上面的 `item == target` 不能编译。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+但 `comparable` 不代表业务相等一定正确。指针可比较，但比较的是地址；结构体可比较，但比较的是所有字段。
 
-- 为泛型函数写多个类型实例的测试，覆盖内置类型和自定义类型。
-- 用编译错误验证约束是否准确表达允许操作。
-- 比较泛型、接口版本的可读性和 benchmark，而不是先入为主。
+## 3. `~int` 和 `int` 作为约束有什么区别？
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+`int` 只允许类型本身是 `int`。
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+type OnlyInt interface {
+	int
+}
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+`~int` 允许底层类型是 `int` 的新类型。
 
-- 项目初期泛型应服务于消除真实重复。
-- 库代码中泛型价值更明显，但 API 设计成本也更高。
-- 过度泛型化会增加初学者理解门槛，不适合替代清晰的具体代码。
+```go
+type IntLike interface {
+	~int
+}
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+type UserID int
 
-### 6. 初学者应该怎么把这个问题学扎实？
+func Add[T IntLike](a, b T) T {
+	return a + b
+}
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+Add(UserID(1), UserID(2)) // 可以
+```
+
+公共库里如果希望支持调用方自定义的新类型，通常需要考虑 `~`。
+
+## 4. 泛型什么时候比接口更合适？
+
+当核心是“同一算法处理不同类型”，而不是“依赖一组行为”时，泛型更合适。
+
+```go
+func Reverse[T any](items []T) {
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+}
+```
+
+接口更适合行为抽象：
+
+```go
+type Sender interface {
+	Send(context.Context, Message) error
+}
+```
+
+如果你只是需要调用 `Send`，接口比泛型更直接。
+
+## 5. 什么时候不应该为了减少重复使用泛型？
+
+当重复很少，或者抽象会让业务语义变模糊时。
+
+```go
+func ValidateEmail(s string) error
+func ValidatePhone(s string) error
+```
+
+这两个函数都接收 string，但校验规则不同。强行抽泛型没有价值。
+
+还有一种情况是约束很复杂：
+
+```go
+func Do[T interface{ ~string | ~[]byte; SomeMethod() }](v T) {}
+```
+
+如果读者理解约束比理解业务还难，就应该重新评估。
+
+## 6. 公共泛型 API 的约束为什么要尽量小？
+
+约束越大，调用方能传入的类型越少。
+
+不必要的窄约束：
+
+```go
+func Keys[M ~map[string]int](m M) []string
+```
+
+它只能处理 `map[string]int` 这一类。
+
+更通用：
+
+```go
+func Keys[M ~map[K]V, K comparable, V any](m M) []K {
+	keys := make([]K, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+```
+
+公共 API 要让约束准确表达“函数真正需要什么”，不要把实现习惯变成调用方限制。

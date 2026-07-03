@@ -6,50 +6,198 @@ Go HTTP client 的超时、连接复用和响应体关闭有哪些坑？
 
 ## 先给结论
 
-Go 的 `http.Client` 应该复用，超时要显式设置，响应体必须关闭。很多线上问题不是不会发请求，而是没有控制超时、没有读完或关闭 body、连接池配置不符合流量模型。
+生产代码里不要每次请求都新建 `http.Client`，也不要直接依赖没有超时的默认配置。`http.Client` 应该复用，超时要分层设置，`resp.Body` 必须关闭；如果要复用连接，通常还要读完响应体或确保 body 被正确丢弃。
 
-## 深入理解
+## 1. 默认 client 没有整体超时
 
-### 1. 这道题真正考察什么
+下面的代码能跑，但下游一直不返回时，请求可能长时间挂住。
 
-- 是否知道默认 `http.Client` 没有整体超时。
-- 是否知道 Response Body 必须关闭。
-- 是否能解释连接复用依赖 Transport 和 body 处理。
-- 是否能区分 client timeout、context timeout、dial timeout 和 header timeout。
+```go
+resp, err := http.Get("https://example.com")
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
+```
 
-### 2. 底层机制要讲清楚
+更稳的写法是配置 client：
 
-- `http.Client` 内部通过 Transport 管理连接池，应该长期复用。
-- 如果响应体不关闭，连接和 goroutine 可能无法及时释放。
-- 要复用连接，通常需要读完 body 或让 Transport 能安全回收连接。
-- 超时可以分层设置：拨号、TLS、响应头、整体请求和业务 context。
+```go
+client := &http.Client{
+	Timeout: 3 * time.Second,
+}
 
-### 3. 工程实践怎么取舍
+resp, err := client.Get("https://example.com")
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
+```
 
-- 创建全局或注入的复用 client，不要每次请求创建新 client。
-- 为请求设置 context deadline，并为 client/transport 设置合理超时。
-- 始终 `defer resp.Body.Close()`，并根据需要处理读取错误。
-- 高并发调用下游时配置连接池上限、空闲连接和每主机连接数。
+`Client.Timeout` 是从发起请求到读取响应体的整体上限，适合简单场景。复杂场景还要配置 Transport 的拨号、TLS、响应头等阶段超时。
 
-### 4. 常见误区
+## 2. client 应该复用，不应该每次创建
 
-- 使用默认 client 调下游，遇到慢请求无限等待。
-- 忘记关闭 body，导致连接泄漏。
-- 每次请求新建 client，失去连接复用并增加 fd 和握手成本。
-- 无脑重试 POST 请求，导致重复写入。
+错误写法：
 
-## 如何验证理解
+```go
+func fetch(url string) error {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+```
 
-- 用 httptest 构造慢响应、慢 header 和大 body 场景。
-- 压测时观察连接数、fd 数、超时率和 goroutine 数。
-- 用 httptrace 或日志验证连接是否复用。
+这样会让连接池难以复用，增加 TCP/TLS 握手成本。推荐把 client 作为依赖传入或全局复用：
+
+```go
+type API struct {
+	client *http.Client
+	base   string
+}
+
+func NewAPI(base string) *API {
+	return &API{
+		base: base,
+		client: &http.Client{
+			Timeout: 3 * time.Second,
+		},
+	}
+}
+```
+
+高并发调用下游时，应该显式配置连接池。
+
+```go
+transport := &http.Transport{
+	MaxIdleConns:        100,
+	MaxIdleConnsPerHost: 20,
+	IdleConnTimeout:     90 * time.Second,
+}
+
+client := &http.Client{
+	Transport: transport,
+	Timeout:   3 * time.Second,
+}
+```
+
+## 3. `resp.Body` 必须关闭
+
+不关闭 body 会导致连接和资源不能及时释放。
+
+```go
+resp, err := client.Get(url)
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
+
+body, err := io.ReadAll(resp.Body)
+if err != nil {
+	return err
+}
+_ = body
+```
+
+如果只关心状态码，也要关闭 body。为了更好复用连接，可以丢弃 body 后关闭：
+
+```go
+resp, err := client.Get(url)
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
+
+_, _ = io.Copy(io.Discard, resp.Body)
+```
+
+是否必须读完才能复用，和协议、Transport 状态有关。面试里保守回答是：关闭必须做；需要连接复用时，应确保 body 被读完或丢弃到 EOF。
+
+## 4. context timeout 和 client timeout 怎么配合
+
+请求级别更推荐从调用链传入 context。
+
+```go
+ctx, cancel := context.WithTimeout(parent, 500*time.Millisecond)
+defer cancel()
+
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+if err != nil {
+	return err
+}
+
+resp, err := client.Do(req)
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
+```
+
+`client.Timeout` 是 client 统一上限，`context` 是单次请求或调用链预算。真实服务中通常两者都会有：client 兜底，请求 context 表达业务 deadline。
+
+## 5. Transport 分阶段超时
+
+下游问题可能发生在不同阶段：连接慢、TLS 慢、响应头慢、body 慢。
+
+```go
+transport := &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   500 * time.Millisecond,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	TLSHandshakeTimeout:   500 * time.Millisecond,
+	ResponseHeaderTimeout: 1 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+client := &http.Client{
+	Transport: transport,
+	Timeout:   3 * time.Second,
+}
+```
+
+面试时不需要背所有字段，但要知道“HTTP 超时不是一个点”，它覆盖多个阶段。
+
+## 6. 用 httptest 验证超时
+
+可以写一个慢响应服务：
+
+```go
+server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(200 * time.Millisecond)
+	w.WriteHeader(http.StatusOK)
+}))
+defer server.Close()
+
+client := &http.Client{Timeout: 50 * time.Millisecond}
+
+_, err := client.Get(server.URL)
+fmt.Println(err != nil) // true
+```
+
+这种测试比只看代码更可靠。
+
+## 7. 面试时怎么答
+
+可以这样回答：
+
+- `http.Client` 要复用，因为它内部通过 Transport 复用连接。
+- 默认 client 没有整体超时，生产代码要设置 timeout。
+- `resp.Body` 必须关闭；为了连接复用，通常还要读完或丢弃 body。
+- context timeout 表示单次请求预算，client timeout 是 client 层兜底。
+- 高并发下要配置连接池，如 `MaxIdleConnsPerHost`。
+- 复杂问题要区分拨号、TLS、响应头、响应体等阶段超时。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“HTTP client”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- 为什么 `http.Client` 要复用？
+- 只调用 `resp.Body.Close()` 够不够？
+- `Client.Timeout` 和 `context.WithTimeout` 有什么区别？
+- 如何用 `httptest` 验证超时和取消？
+- 高并发调用下游时连接池怎么配置？

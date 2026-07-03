@@ -1,60 +1,166 @@
 # 075. 并发错误 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 WaitGroup 不适合处理错误传播？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为 `WaitGroup` 没有错误通道，也没有取消语义。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+var wg sync.WaitGroup
 
-- goroutine 的返回值不会自动传回调用者，必须通过 channel、共享变量加锁或封装工具收集。
-- errgroup 会等待一组函数完成，并返回第一个非 nil 错误。
-- 配合 context 的 errgroup 可以在某个任务失败后通知其他任务退出。
-- 结果写入共享 slice 或 map 时仍然需要同步或预分配按索引写入。
+for _, task := range tasks {
+	wg.Add(1)
+	go func(task Task) {
+		defer wg.Done()
+		if err := task.Run(); err != nil {
+			// 这里的 err 没有地方安全返回给调用方
+		}
+	}(task)
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+wg.Wait()
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+如果你只是“等所有任务结束”，WaitGroup 足够。如果你要“任一失败就返回错误，并通知其他任务停止”，就需要额外机制。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+## 2. 错误 channel 为什么容易写出 goroutine 泄漏？
 
-- 只等待任务完成时用 WaitGroup。
-- 需要错误传播和取消时用 errgroup。
-- 任务很多时设置并发上限，避免瞬间启动过多 goroutine。
-- 每个任务内部必须监听 context，否则取消信号不会生效。
+无缓冲错误 channel 如果没有接收者，发送方会阻塞。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+errCh := make(chan error)
 
-### 3. 这道题最容易追问哪些坑？
+go func() {
+	errCh <- errors.New("failed") // 如果没人接收，会一直阻塞
+}()
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+常见修正是使用足够缓冲，或者专门起 goroutine 等待关闭。
 
-- 多个 goroutine 同时 append 结果 slice，产生数据竞争。
-- 一个任务失败后其他任务继续做无意义工作。
-- 错误 channel 无缓冲或无人接收，导致 goroutine 阻塞。
-- 只返回第一个错误，忽略是否需要聚合所有错误。
+```go
+errCh := make(chan error, len(tasks))
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+for _, task := range tasks {
+	go func(task Task) {
+		errCh <- task.Run()
+	}(task)
+}
+```
 
-### 4. 如何证明你的判断是对的？
+但即使错误 channel 不阻塞，一个任务失败后其他任务仍会继续执行。要停止其他任务，需要 context。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+## 3. errgroup 取消 context 后 goroutine 会立刻停止吗？
 
-- 用 race detector 检查结果收集是否安全。
-- 写测试模拟一个任务失败，确认其他任务能及时取消。
-- 用 goroutine profile 检查失败后是否有任务泄漏。
+不会。context 只是一个取消信号，goroutine 要主动检查它。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+不会及时退出的任务：
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+g, ctx := errgroup.WithContext(parent)
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+g.Go(func() error {
+	time.Sleep(10 * time.Second) // 不理 ctx
+	return nil
+})
 
-- 少量并发任务手写 channel 也可接受。
-- 服务代码中 errgroup 能统一错误、取消和等待语义。
-- 批量任务规模变大后，还要考虑并发上限、重试和部分失败策略。
+_ = ctx
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+更好的写法：
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```go
+g.Go(func() error {
+	select {
+	case <-time.After(10 * time.Second):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+})
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+真实 I/O 调用也要传 context，例如 `http.NewRequestWithContext`、`QueryContext`。
+
+## 4. 多 goroutine 收集结果有哪些安全写法？
+
+第一种：预分配 slice，每个 goroutine 写独立下标。
+
+```go
+results := make([]Result, len(ids))
+
+for i, id := range ids {
+	i, id := i, id
+	g.Go(func() error {
+		r, err := load(ctx, id)
+		if err != nil {
+			return err
+		}
+		results[i] = r
+		return nil
+	})
+}
+```
+
+第二种：用 mutex 保护 append。
+
+```go
+var (
+	mu      sync.Mutex
+	results []Result
+)
+
+g.Go(func() error {
+	r, err := load(ctx, id)
+	if err != nil {
+		return err
+	}
+	mu.Lock()
+	results = append(results, r)
+	mu.Unlock()
+	return nil
+})
+```
+
+第三种：用 channel 汇总，由单个 goroutine append。
+
+```go
+resultCh := make(chan Result)
+```
+
+选择标准：需要保序时用下标写入；不保序且数量不大时 mutex 简单；流水线式处理用 channel 更自然。
+
+## 5. 只返回第一个错误够不够？
+
+不一定。`errgroup` 默认返回第一个错误，适合“任一失败整体失败”的任务。
+
+```go
+if err := g.Wait(); err != nil {
+	return err
+}
+```
+
+如果业务需要展示所有失败项，就要聚合错误。
+
+```go
+var (
+	mu   sync.Mutex
+	errs []error
+)
+
+for _, task := range tasks {
+	task := task
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := task.Run(); err != nil {
+			mu.Lock()
+			errs = append(errs, err)
+			mu.Unlock()
+		}
+	}()
+}
+wg.Wait()
+
+return errors.Join(errs...)
+```
+
+面试回答要说清楚业务语义：是 fail-fast，还是尽量执行完并汇总所有错误。

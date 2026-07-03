@@ -1,60 +1,218 @@
 # 011. const 和 iota - 面试追问
 
-## 追问与参考答案
+## 1. 无类型常量和有类型常量有什么区别？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+无类型常量会在使用时根据上下文确定类型。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+const n = 10
 
-- 无类型常量具有更高精度和更灵活的赋值能力。
-- iota 的递增单位是 const 声明行，不是每个名字。
-- 省略表达式时会复用上一行表达式，因此常见写法是 `1 << iota` 定义 bit mask。
-- Go 的枚举只是类型化常量集合，编译器不会保证变量只能取这些常量值。
+var a int = n
+var b int64 = n
+var c float64 = n
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+有类型常量已经固定类型：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+const n int = 10
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+var a int = n
+// var b int64 = n // 编译错误
+```
 
-- 给枚举定义独立类型，提高可读性并避免和普通 int 混用。
-- 为枚举实现 `String()`、校验函数或 JSON 编解码，补足封闭性。
-- 协议字段常量要显式固定数值，避免插入新项导致兼容性变化。
-- 位标志适合组合状态，但互斥状态不要用 bit mask 表达。
+无类型常量还有更高精度，常用于数值表达式：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+const x = 1.0 / 3.0
+var f float64 = x
+```
 
-### 3. 这道题最容易追问哪些坑？
+面试回答可以说：无类型常量提高了常量表达式的灵活性，但一旦赋给变量，就会变成具体类型的值。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. `iota` 是按行递增还是按名字递增？
 
-- 在已有协议常量中间插入 iota，导致数值整体变化。
-- 以为 Go enum 会禁止非法值。
-- 不理解省略表达式复用，读不懂复杂 const 块。
-- 把业务可变配置写成 const，导致部署后无法调整。
+按 const 声明块里的行递增，不是按名字递增。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+const (
+	A, B = iota, iota
+	C, D
+	E
+)
 
-### 4. 如何证明你的判断是对的？
+fmt.Println(A, B) // 0 0
+fmt.Println(C, D) // 1 1
+fmt.Println(E)    // 2
+```
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+同一行的多个常量共享同一个 `iota` 值。
 
-- 用小例子打印 iota 在空白行、多个名字同一行、显式赋值后的值。
-- 为协议枚举写兼容性测试，固定数字值。
-- 对外输出时测试未知枚举值的处理方式。
+空白标识符所在行也会消耗一个 iota：
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+const (
+	_ = iota
+	One
+	Two
+)
 
-### 5. 当规模变大后，这个问题会如何升级？
+fmt.Println(One, Two) // 1 2
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 3. 省略表达式时，`const` 块会复用什么？
 
-- 内部临时代码里 iota 可以提高编写效率。
-- 跨服务、落库、日志和 API 协议中，常量数值一旦发布就要保持稳定。
-- 枚举数量变多后，应补充校验、字符串化和文档，而不只是堆常量。
+会复用上一行的表达式，但其中的 `iota` 值会按当前行重新计算。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+const (
+	A = iota * 10
+	B
+	C
+)
 
-### 6. 初学者应该怎么把这个问题学扎实？
+fmt.Println(A, B, C) // 0 10 20
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+`B` 不是直接复制 `A` 的值，而是复用表达式 `iota * 10`，此时 `iota == 1`。
+
+更复杂一点：
+
+```go
+const (
+	A = iota
+	B = 100
+	C
+	D = iota
+)
+
+fmt.Println(A, B, C, D) // 0 100 100 3
+```
+
+`C` 复用上一行表达式 `100`，所以还是 100。`D` 显式使用当前行的 `iota`，所以是 3。
+
+## 4. 为什么 `1 << iota` 常用于位标志？
+
+因为它可以生成 1、2、4、8 这样的二进制位，每个常量占一个独立 bit，适合组合。
+
+```go
+type Flag uint8
+
+const (
+	Read Flag = 1 << iota
+	Write
+	Execute
+)
+
+func Has(flags, target Flag) bool {
+	return flags&target != 0
+}
+
+func main() {
+	flags := Read | Write
+	fmt.Println(Has(flags, Read))    // true
+	fmt.Println(Has(flags, Execute)) // false
+}
+```
+
+如果状态互斥，不要用 bit mask。
+
+```go
+type Status int
+
+const (
+	Pending Status = iota
+	Running
+	Done
+)
+```
+
+订单不应该同时是 Pending 和 Done，所以普通枚举更清楚。
+
+## 5. Go 的枚举为什么不能阻止非法值？
+
+Go 没有封闭 enum。自定义类型加常量只能提高可读性，不能保证变量只取这些常量。
+
+```go
+type Status int
+
+const (
+	Pending Status = iota
+	Running
+	Done
+)
+
+var s Status = 99 // 可以编译
+```
+
+所以需要在边界处校验：
+
+```go
+func (s Status) Valid() bool {
+	switch s {
+	case Pending, Running, Done:
+		return true
+	default:
+		return false
+	}
+}
+```
+
+如果来自 JSON、数据库、RPC 的值要转成枚举，必须处理未知值。
+
+```go
+func ParseStatus(n int) (Status, error) {
+	s := Status(n)
+	if !s.Valid() {
+		return 0, fmt.Errorf("invalid status %d", n)
+	}
+	return s, nil
+}
+```
+
+## 6. 对外协议常量为什么不建议随便用 iota 插入新项？
+
+因为 `iota` 的值依赖声明顺序。中间插入一行，会改变后续所有值。
+
+```go
+const (
+	User = iota
+	Admin
+)
+```
+
+此时 `User == 0`，`Admin == 1`。
+
+后来改成：
+
+```go
+const (
+	Guest = iota
+	User
+	Admin
+)
+```
+
+`User` 变成 1，`Admin` 变成 2。旧数据、旧客户端、旧日志都会被错误解释。
+
+稳定协议建议显式赋值：
+
+```go
+const (
+	User  = 1
+	Admin = 2
+	Guest = 3
+)
+```
+
+并用测试固定：
+
+```go
+func TestRoleValues(t *testing.T) {
+	if User != 1 || Admin != 2 || Guest != 3 {
+		t.Fatal("role values changed")
+	}
+}
+```
+
+面试里可以总结：内部临时代码用 iota 很方便；跨边界、落库、对外协议要优先稳定性。

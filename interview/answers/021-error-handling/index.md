@@ -6,58 +6,237 @@ Go 为什么推荐显式返回 error？`errors.Is/As` 和 wrapping 怎么用？
 
 ## 先给结论
 
-Go 推荐显式返回 error，是为了让失败路径成为函数签名的一部分。深入回答要覆盖错误语义、包装链、哨兵错误、自定义错误类型和调用方决策。
+Go 推荐显式返回 `error`，是为了让失败路径出现在函数签名里，让调用方必须处理。
 
-## 深入理解
+`error` 本质是接口：
 
-### 1. 这道题真正考察什么
+```go
+type error interface {
+	Error() string
+}
+```
 
-- 是否知道 error 是接口，核心方法是 `Error() string`。
-- 是否能解释为什么不要只根据错误字符串做判断。
-- 是否会使用 `%w`、`errors.Is`、`errors.As` 保留和检查错误语义。
-- 是否能区分可重试、不可重试、参数错误、依赖错误等类别。
+实际项目里，好的错误处理不只是 `if err != nil { return err }`，还要做到：
 
-### 2. 底层机制要讲清楚
+- 给错误加上下文。
+- 保留原始错误语义。
+- 调用方不要靠字符串判断错误。
+- 在合适边界把错误映射成重试、HTTP 状态码、用户提示或日志。
 
-- 显式 error 让调用者必须面对失败路径，避免异常式控制流隐藏在任意位置。
-- 错误包装保留上下文，同时通过 unwrap 链保留原始错误。
-- 哨兵错误适合稳定、少量、需要相等判断的错误语义。
-- 自定义错误类型适合携带结构化字段，让上层根据字段决策。
+## 基础写法：立即处理错误
 
-### 3. 工程实践怎么取舍
+```go
+func LoadConfig(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+```
 
-- 底层返回错误时添加关键上下文，例如操作、资源 ID、依赖名称。
-- 跨包暴露的错误语义要稳定，不要随意改哨兵错误或类型。
-- 日志只在合适边界记录，避免每层都打同一个错误。
-- 不要吞掉错误；确实忽略时写明原因。
+Go 不用异常表达普通失败。文件不存在、参数非法、网络超时、数据库返回空结果，这些都应该通过 `error` 返回。
 
-### 4. 常见误区
+## 加上下文，但不要丢失原始错误
 
-- 用 `fmt.Errorf("... %v", err)` 丢失 unwrap 链。
-- 调用方匹配错误字符串，导致文案变化破坏逻辑。
-- 每层都记录日志，最终一条失败刷出多条重复日志。
-- 把 panic 当作普通业务错误处理。
-
-## 如何验证理解
-
-- 写测试验证 `errors.Is` 和 `errors.As` 在包装后仍然生效。
-- 对公共错误类型写兼容性测试。
-- 在接口层测试错误到 HTTP 状态码、重试策略或用户提示的映射。
-
-## 代码示例
+不推荐：
 
 ```go
 if err != nil {
-	return fmt.Errorf("load config: %w", err)
+	return fmt.Errorf("load config failed: %v", err)
 }
 ```
+
+这里 `%v` 只是把错误转成字符串，调用方无法用 `errors.Is` 找回原始错误。
+
+推荐：
+
+```go
+if err != nil {
+	return fmt.Errorf("load config %s: %w", path, err)
+}
+```
+
+`%w` 会包装错误，形成 unwrap 链。
+
+调用方可以判断：
+
+```go
+data, err := LoadConfig("app.yaml")
+if errors.Is(err, os.ErrNotExist) {
+	return defaultConfig(), nil
+}
+if err != nil {
+	return nil, err
+}
+_ = data
+```
+
+这样既有上下文，又保留了机器可判断的错误语义。
+
+## 不要用字符串判断错误
+
+错误示例：
+
+```go
+if strings.Contains(err.Error(), "not exist") {
+	// fragile
+}
+```
+
+问题是错误文案可能变化、语言可能变化、底层依赖可能变化。
+
+更好的做法是用 `errors.Is` 判断稳定错误：
+
+```go
+if errors.Is(err, os.ErrNotExist) {
+	// file missing
+}
+```
+
+或者用 `errors.As` 提取错误类型：
+
+```go
+var pathErr *fs.PathError
+if errors.As(err, &pathErr) {
+	fmt.Println(pathErr.Op, pathErr.Path)
+}
+```
+
+## 哨兵错误适合稳定语义
+
+```go
+var ErrNotFound = errors.New("not found")
+
+func FindUser(id int64) (*User, error) {
+	if id <= 0 {
+		return nil, ErrNotFound
+	}
+	return &User{ID: id}, nil
+}
+```
+
+调用方：
+
+```go
+u, err := FindUser(id)
+if errors.Is(err, ErrNotFound) {
+	return nil, nil
+}
+if err != nil {
+	return nil, err
+}
+return u, nil
+```
+
+如果要加上下文：
+
+```go
+return nil, fmt.Errorf("find user %d: %w", id, ErrNotFound)
+```
+
+哨兵错误的代价是：一旦对外暴露，它就成了 API 契约，不要随便改。
+
+## 自定义错误类型适合结构化信息
+
+```go
+type ValidationError struct {
+	Field string
+	Msg   string
+}
+
+func (e *ValidationError) Error() string {
+	return e.Field + ": " + e.Msg
+}
+
+func ValidateUser(u User) error {
+	if u.Name == "" {
+		return &ValidationError{Field: "name", Msg: "required"}
+	}
+	return nil
+}
+```
+
+调用方用 `errors.As`：
+
+```go
+var ve *ValidationError
+if errors.As(err, &ve) {
+	return http.StatusBadRequest, ve.Field
+}
+```
+
+自定义类型适合携带字段、错误码、是否可重试等结构化信息。
+
+## 日志应该在边界打
+
+不推荐每层都打日志：
+
+```go
+func repo() error {
+	err := query()
+	if err != nil {
+		log.Println("repo:", err)
+		return err
+	}
+	return nil
+}
+
+func service() error {
+	err := repo()
+	if err != nil {
+		log.Println("service:", err)
+		return err
+	}
+	return nil
+}
+```
+
+一条失败可能刷出多条重复日志。
+
+更常见的做法是：底层加上下文并返回，边界统一记录。
+
+```go
+func repo() error {
+	if err := query(); err != nil {
+		return fmt.Errorf("query user: %w", err)
+	}
+	return nil
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	if err := service(); err != nil {
+		slog.Error("request failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+```
+
+## 什么时候可以忽略错误
+
+可以忽略，但要明确原因。
+
+```go
+_ = os.Remove(tmpFile) // best effort cleanup
+```
+
+如果这个错误影响业务，就不能吞：
+
+```go
+if err := rows.Close(); err != nil {
+	return fmt.Errorf("close rows: %w", err)
+}
+```
+
+经验是：忽略错误时，读代码的人应该能看出这是有意的，不是漏处理。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“error 处理”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- 为什么 `%w` 比 `%v` 更适合包装错误？
+- `errors.Is` 和 `errors.As` 分别解决什么问题？
+- 什么时候用哨兵错误，什么时候用自定义错误类型？
+- 为什么不建议靠错误字符串做业务判断？
+- 错误日志应该每层都打吗？
+- 普通业务错误为什么不应该用 panic 表达？

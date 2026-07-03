@@ -6,61 +6,196 @@ Go 泛型解决什么问题？什么时候不应该用泛型？
 
 ## 先给结论
 
-Go 泛型用于表达类型参数化的算法和数据结构，避免重复代码和空接口断言。它解决的是“同一逻辑适用于一组类型”，不是所有抽象问题。
+泛型解决的是“同一套逻辑适用于一组类型”的问题，让代码在保留静态类型检查的同时减少重复。
 
-## 深入理解
+适合泛型的场景：
 
-### 1. 这道题真正考察什么
+- 容器和集合操作。
+- 通用算法。
+- 类型安全的缓存、队列、栈。
+- 对多个类型做相同操作，并且操作能用约束清楚表达。
 
-- 是否知道类型参数、类型约束和实例化的基本概念。
-- 是否能区分泛型、接口和代码生成各自适合的场景。
-- 是否理解约束描述的是可用操作，不只是类型列表。
-- 是否知道过度泛型会降低可读性。
+不适合泛型的场景：
 
-### 2. 底层机制要讲清楚
+- 只是为了炫技。
+- 业务逻辑本来就不重复。
+- 需要动态派发行为时，接口更自然。
+- 约束写得比业务逻辑还复杂。
 
-- 类型参数让函数或类型在编译期针对不同类型进行检查。
-- 约束接口可以包含方法集，也可以包含类型集合，例如 `~int | ~int64`。
-- `comparable` 约束允许在泛型代码里使用 `==` 和作为 map key。
-- 泛型保留静态类型信息，避免空接口带来的运行时断言和类型错误。
-
-### 3. 工程实践怎么取舍
-
-- 容器、集合操作、数值算法、通用缓存结构适合泛型。
-- 需要行为抽象和动态派发时，接口仍然更合适。
-- 只有两个类型且逻辑并不复杂时，重复少量代码可能比泛型更清晰。
-- 公共泛型 API 的约束要尽量小，给调用方保留类型空间。
-
-### 4. 常见误区
-
-- 为了展示技巧，把简单业务逻辑写成复杂类型参数。
-- 约束过宽，函数体实际使用了未被约束保证的操作。
-- 约束过窄，导致本可复用的自定义底层类型不能传入。
-- 把泛型当成继承体系使用。
-
-## 如何验证理解
-
-- 为泛型函数写多个类型实例的测试，覆盖内置类型和自定义类型。
-- 用编译错误验证约束是否准确表达允许操作。
-- 比较泛型、接口版本的可读性和 benchmark，而不是先入为主。
-
-## 代码示例
+## 泛型函数
 
 ```go
-func Max[T cmp.Ordered](a, b T) T {
-	if a > b {
-		return a
+func Index[T comparable](items []T, target T) int {
+	for i, item := range items {
+		if item == target {
+			return i
+		}
 	}
-	return b
+	return -1
 }
 ```
+
+调用：
+
+```go
+fmt.Println(Index([]int{1, 2, 3}, 2))
+fmt.Println(Index([]string{"go", "java"}, "go"))
+```
+
+`T comparable` 表示 `T` 必须支持 `==`，否则函数体里的 `item == target` 不能编译。
+
+如果写成 `T any`：
+
+```go
+func BadIndex[T any](items []T, target T) int {
+	for i, item := range items {
+		// if item == target { // 编译错误
+		// 	return i
+		// }
+		_ = item
+	}
+	return -1
+}
+```
+
+约束不是装饰，它决定函数体里可以对 `T` 做什么操作。
+
+## 泛型类型
+
+```go
+type Stack[T any] struct {
+	items []T
+}
+
+func (s *Stack[T]) Push(v T) {
+	s.items = append(s.items, v)
+}
+
+func (s *Stack[T]) Pop() (T, bool) {
+	if len(s.items) == 0 {
+		var zero T
+		return zero, false
+	}
+
+	last := len(s.items) - 1
+	v := s.items[last]
+	s.items = s.items[:last]
+	return v, true
+}
+```
+
+使用：
+
+```go
+var ints Stack[int]
+ints.Push(1)
+
+v, ok := ints.Pop()
+fmt.Println(v, ok)
+```
+
+这里不需要 `any` 加类型断言，编译器知道 `Stack[int]` 只能放 `int`。
+
+## 类型集合和 `~`
+
+约束可以限制底层类型。
+
+```go
+type Integer interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64
+}
+
+func Add[T Integer](a, b T) T {
+	return a + b
+}
+```
+
+`~int` 表示“底层类型是 int 的类型”也可以传入。
+
+```go
+type UserID int
+
+fmt.Println(Add(UserID(1), UserID(2))) // 可以
+```
+
+如果约束写成 `int` 而不是 `~int`，`UserID` 这种新类型就不能传入。
+
+约束过窄会限制复用，约束过宽又无法保证函数体里的操作。好的约束应该刚好表达函数需要的能力。
+
+## 泛型、接口、any 的区别
+
+泛型保留静态类型：
+
+```go
+func First[T any](items []T) (T, bool) {
+	if len(items) == 0 {
+		var zero T
+		return zero, false
+	}
+	return items[0], true
+}
+```
+
+接口适合行为抽象：
+
+```go
+type Reader interface {
+	Read([]byte) (int, error)
+}
+
+func CopyAll(r Reader) ([]byte, error) {
+	return io.ReadAll(r)
+}
+```
+
+`any` 适合确实未知的动态值：
+
+```go
+func LogValue(key string, value any) {
+	slog.Info("value", key, value)
+}
+```
+
+不要把三者混在一起：
+
+- 想复用类型安全算法，用泛型。
+- 想依赖行为，用接口。
+- 想接收未知值，用 `any`。
+
+## 什么时候不要用泛型
+
+只有两个简单类型，重复代码可能更清楚：
+
+```go
+func ParseUserID(s string) (UserID, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	return UserID(n), err
+}
+
+func ParseOrderID(s string) (OrderID, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	return OrderID(n), err
+}
+```
+
+没必要为了合并这两段写出难懂的类型参数和约束。
+
+业务流程也不适合强行泛型化：
+
+```go
+func ApproveInvoice(inv Invoice) error
+func ApproveExpense(exp Expense) error
+```
+
+如果两者规则不同，名字相似不代表应该抽泛型。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“泛型”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- 泛型和 `any` 最大区别是什么？
+- 约束里的 `comparable` 有什么作用？
+- `~int` 和 `int` 作为约束有什么区别？
+- 泛型什么时候比接口更合适？
+- 什么时候不应该为了减少重复使用泛型？
+- 公共泛型 API 的约束为什么要尽量小？

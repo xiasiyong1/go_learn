@@ -1,60 +1,166 @@
 # 063. 控制流 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么 Go 不允许 `if 1 {}`？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+Go 要求条件表达式必须是 `bool`，这样可以避免“哪些值算真、哪些值算假”的隐式规则。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+func main() {
+	n := 1
 
-- 初始化语句创建的变量只在整个 if 或 switch 语句内部可见。
-- switch case 从上到下匹配，匹配后执行对应分支并默认结束。
-- case 表达式可以有多个值，也可以省略 switch 表达式写成条件 switch。
-- Go 没有三元表达式，复杂条件应拆成清晰的 if。
+	// if n {             // 编译失败
+	// 	fmt.Println(n)
+	// }
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+	if n > 0 {
+		fmt.Println(n)
+	}
+}
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+这条规则也影响指针、字符串和 slice：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+var s []int
 
-- 错误处理常用 `if err := f(); err != nil { return err }` 控制作用域。
-- 多分支枚举判断使用 switch，比长串 if-else 更清晰。
-- 条件复杂时先提取命名变量，降低读者理解成本。
-- 避免 fallthrough，除非确实要表达非常特殊的贯穿语义。
+// if s { } // 编译失败
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+if s != nil {
+	fmt.Println("not nil")
+}
+```
 
-### 3. 这道题最容易追问哪些坑？
+面试回答可以强调：Go 倾向显式判断，减少跨语言习惯带来的歧义。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. `if err := f(); err != nil` 的变量作用域到哪里？
 
-- 在 if 初始化语句外使用局部变量，编译失败。
-- 从 C/Java 习惯迁移过来，以为 switch 会默认贯穿。
-- 使用 fallthrough 后，下一个 case 条件不会重新判断。
-- 为了压缩行数，把复杂逻辑都塞进条件表达式。
+初始化语句里的变量在整个 `if/else` 结构中有效，离开后不可见。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+if user, err := loadUser(id); err != nil {
+	return err
+} else {
+	fmt.Println(user.Name) // user 和 err 在 else 里也可见
+}
 
-### 4. 如何证明你的判断是对的？
+// user 在这里不可见
+```
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+如果后面还要用 `user`，就不要把它声明在 `if` 里。
 
-- 写小例子验证 if 初始化变量的作用域。
-- 写 switch 用例覆盖默认 break 和 fallthrough 行为。
-- 对枚举 switch 增加 default 分支测试未知值。
+```go
+user, err := loadUser(id)
+if err != nil {
+	return err
+}
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+return render(user)
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+这也是 Go 代码常见风格：临时变量尽量小作用域，需要跨步骤使用的变量就放到外面。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 3. Go 的 `switch` 和 C/Java 的 switch 最大区别是什么？
 
-- 基础控制流影响代码可读性。
-- 业务状态分支变多后，switch 是否完整覆盖会影响稳定性。
-- 复杂状态机应考虑表驱动或显式状态类型，而不是无限堆 if-else。
+Go 默认不会贯穿，所以不需要每个 case 都写 `break`。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+switch status {
+case "new":
+	return "created"
+case "done":
+	return "finished"
+default:
+	return "unknown"
+}
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+在 C/Java 里忘记 `break` 是常见 bug；在 Go 里只有显式写 `fallthrough` 才会继续执行下一个 case。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+Go 的 switch 也更灵活，可以没有 switch 表达式：
+
+```go
+switch {
+case age < 18:
+	return "child"
+case age < 60:
+	return "adult"
+default:
+	return "senior"
+}
+```
+
+这相当于一组更清晰的 if-else。
+
+## 4. `fallthrough` 为什么容易误导？
+
+因为它不会判断下一个 case 条件，直接进入下一个 case 代码块。
+
+```go
+func print(n int) {
+	switch n {
+	case 1:
+		fmt.Println("one")
+		fallthrough
+	case 2:
+		fmt.Println("two")
+	}
+}
+
+print(1)
+// one
+// two
+```
+
+`n` 明明不是 2，却执行了 case 2 的代码。更清楚的写法通常是把共同逻辑提取出来：
+
+```go
+switch n {
+case 1:
+	fmt.Println("one")
+	printCommon()
+case 2:
+	fmt.Println("two")
+	printCommon()
+}
+```
+
+如果只是多个值走同一个分支，用逗号列出来：
+
+```go
+switch code {
+case 200, 201, 204:
+	return "success"
+}
+```
+
+## 5. 分支很多时，什么时候继续用 switch，什么时候改成表驱动？
+
+如果分支逻辑短、数量少、每个 case 都有不同处理，`switch` 很清楚。
+
+```go
+switch op {
+case "add":
+	return a + b
+case "sub":
+	return a - b
+default:
+	return 0
+}
+```
+
+如果分支只是“根据 key 查一个配置、函数或固定结果”，表驱动更好。
+
+```go
+var handlers = map[string]func(int, int) int{
+	"add": func(a, b int) int { return a + b },
+	"sub": func(a, b int) int { return a - b },
+}
+
+fn, ok := handlers[op]
+if !ok {
+	return 0
+}
+return fn(a, b)
+```
+
+判断标准是：分支数量增长时，修改是否仍然局部、可测试、可读。如果每加一种类型都要改很长的 switch，通常说明可以考虑表驱动或接口多态。

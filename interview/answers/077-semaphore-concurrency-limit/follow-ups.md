@@ -1,60 +1,131 @@
 # 077. 并发限制 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么带缓冲 channel 可以当信号量？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为 channel 容量可以表示可用许可数量。写入一个空结构体表示占用一个许可，读出一个值表示释放一个许可。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+sem := make(chan struct{}, 2)
 
-- 信号量维护有限许可，获取许可后才能执行受保护逻辑。
-- 带缓冲 channel 中写入 token 表示占用许可，读取 token 表示释放许可。
-- worker pool 固定执行者数量，任务通过队列分发。
-- 加权信号量可以让不同任务消耗不同数量资源。
+sem <- struct{}{} // 第 1 个许可
+sem <- struct{}{} // 第 2 个许可
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+// sem <- struct{}{} // 第 3 个会阻塞
 
-### 2. 这个知识点在真实项目里怎么取舍？
+<-sem // 释放 1 个许可
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+`struct{}{}` 不携带数据，通常只用来表达信号。
 
-- 保护数据库、RPC 下游、文件句柄等有限资源时使用并发限制。
-- 用 `defer release()` 确保错误路径释放许可。
-- 获取许可时支持 context，避免请求取消后仍等待。
-- 如果任务需要排队和生命周期管理，worker pool 可能更清晰。
+## 2. 忘记释放许可会发生什么？
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+容量会被永久占用，最终所有 goroutine 都阻塞在 acquire。
 
-### 3. 这道题最容易追问哪些坑？
+```go
+func bad(sem chan struct{}) error {
+	sem <- struct{}{}
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+	if err := do(); err != nil {
+		return err // 泄漏许可
+	}
 
-- 异常分支忘记释放许可，最终所有请求卡死。
-- 把并发限制当速率限制，无法控制单位时间请求数。
-- 信号量容量设置过大，保护不了下游。
-- 在持有许可期间执行不相关慢操作，降低整体吞吐。
+	<-sem
+	return nil
+}
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+正确写法：
 
-### 4. 如何证明你的判断是对的？
+```go
+func good(sem chan struct{}) error {
+	sem <- struct{}{}
+	defer func() { <-sem }()
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+	return do()
+}
+```
 
-- 写并发测试统计同时执行数量不超过上限。
-- 测试任务 panic 或返回错误时许可是否释放。
-- 压测不同上限下的延迟、错误率和下游负载。
+如果 do 里 panic，defer 仍会执行。但 panic 是否恢复，要看你是否额外 recover。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+## 3. 如何让等待许可支持 context 取消？
 
-### 5. 当规模变大后，这个问题会如何升级？
+用 select 同时等待许可和 context。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+func acquire(ctx context.Context, sem chan struct{}) error {
+	select {
+	case sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
 
-- 本地保护资源时信号量简单有效。
-- 多实例服务中，每个实例的本地限制不等于全局限制。
-- 平台级限流需要结合分布式配额、队列和下游容量模型。
+使用：
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+if err := acquire(ctx, sem); err != nil {
+	return err
+}
+defer func() { <-sem }()
 
-### 6. 初学者应该怎么把这个问题学扎实？
+return call(ctx)
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+这对 HTTP 服务很重要：客户端已经断开或请求超时，就不应该继续排队等待下游许可。
+
+## 4. 信号量和 worker pool 怎么选？
+
+同步请求里限制某段下游调用，用信号量。
+
+```go
+func (s *Service) Get(ctx context.Context, id string) error {
+	if err := acquire(ctx, s.dbSem); err != nil {
+		return err
+	}
+	defer release(s.dbSem)
+
+	return s.repo.Load(ctx, id)
+}
+```
+
+批量后台任务、持续消费队列，用 worker pool。
+
+```go
+jobs := make(chan Job)
+
+for i := 0; i < 10; i++ {
+	go func() {
+		for job := range jobs {
+			process(job)
+		}
+	}()
+}
+```
+
+判断标准：你是在保护一段代码的同时执行数，还是在设计一套任务队列和 worker 生命周期。
+
+## 5. 并发限制和限流有什么区别？
+
+并发限制看的是同时执行数量。
+
+```go
+sem := make(chan struct{}, 10) // 最多 10 个同时执行
+```
+
+限流看的是单位时间允许多少请求。
+
+```go
+limiter := time.NewTicker(10 * time.Millisecond)
+defer limiter.Stop()
+
+for _, req := range requests {
+	<-limiter.C
+	go handle(req)
+}
+```
+
+举例：一个请求耗时 1 秒，并发限制 10，理论吞吐约 10 QPS；如果请求耗时变成 100ms，同样并发限制 10，理论吞吐会变成 100 QPS。限流则直接控制速率。
+
+稳定性设计里，两者经常一起用。

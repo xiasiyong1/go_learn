@@ -6,50 +6,218 @@ Go 中依赖注入应该怎么做？如何让代码更容易测试？
 
 ## 先给结论
 
-Go 不要求复杂 DI 框架，常见做法是通过构造函数、接口和函数参数显式传入依赖。好的依赖注入让业务逻辑不直接依赖全局状态、真实网络和真实数据库。
+Go 不需要复杂 DI 框架也能写出可测试代码。核心做法是：依赖通过构造函数或函数参数显式传入，外部系统通过小接口隔离，时间、随机数、网络、数据库等不可控因素可以替换成 fake。目标不是“为了接口而接口”，而是让业务逻辑可以在单元测试里稳定验证。
 
-## 深入理解
+## 1. 不要在业务代码里直接创建外部依赖
 
-### 1. 这道题真正考察什么
+不推荐：
 
-- 是否知道依赖注入的目标是控制依赖和提升可测试性。
-- 是否能通过小接口替换外部依赖。
-- 是否能识别全局变量和单例对测试的影响。
-- 是否知道过度抽象也会增加理解成本。
+```go
+func Notify(userID string) error {
+	resp, err := http.Get("https://api.example.com/users/" + userID)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 
-### 2. 底层机制要讲清楚
+	return nil
+}
+```
 
-- 构造函数把依赖集中传入，形成清晰的对象生命周期。
-- 接口让测试可以提供 fake 或 mock 实现。
-- 函数参数注入适合简单依赖，例如时间函数、随机数或回调。
-- 全局状态会让测试之间相互影响，导致顺序相关和并发问题。
+这个函数测试时必须打真实网络，难以覆盖超时、500、返回体异常等场景。
 
-### 3. 工程实践怎么取舍
+改成依赖注入：
 
-- 业务服务结构体通过构造函数接收 repository、client、logger、clock 等依赖。
-- 接口定义在使用方，保持方法最小。
-- 对时间、随机数和外部调用提供可替换依赖。
-- 不要为了测试把所有东西都抽象成接口，先看是否真的需要替换。
+```go
+type UserClient interface {
+	LoadUser(ctx context.Context, id string) (User, error)
+}
 
-### 4. 常见误区
+type Service struct {
+	users UserClient
+}
 
-- 业务代码直接调用全局 client，测试只能打真实依赖。
-- 接口过大，fake 实现成本很高。
-- 测试修改全局变量后没有恢复，影响其他测试。
-- 引入复杂 DI 框架，掩盖简单依赖关系。
+func NewService(users UserClient) *Service {
+	return &Service{users: users}
+}
 
-## 如何验证理解
+func (s *Service) Notify(ctx context.Context, userID string) error {
+	user, err := s.users.LoadUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	_ = user
+	return nil
+}
+```
 
-- 为业务逻辑写不依赖网络和数据库的单元测试。
-- 使用 fake 验证错误路径、超时和边界条件。
-- 并行运行测试，检查是否存在共享全局状态污染。
+## 2. 接口定义在使用方，并且尽量小
+
+如果业务只需要查询用户，就不要依赖一个巨大的 repository。
+
+```go
+type UserFinder interface {
+	FindUser(ctx context.Context, id string) (User, error)
+}
+
+type Handler struct {
+	users UserFinder
+}
+```
+
+测试 fake 很简单：
+
+```go
+type fakeUsers struct {
+	user User
+	err  error
+}
+
+func (f fakeUsers) FindUser(ctx context.Context, id string) (User, error) {
+	return f.user, f.err
+}
+```
+
+接口越小，fake 越容易写，测试越聚焦。
+
+## 3. 时间要可替换
+
+不推荐业务逻辑里直接 `time.Now()`。
+
+```go
+func Expired(deadline time.Time) bool {
+	return time.Now().After(deadline)
+}
+```
+
+测试会依赖当前时间。改成注入 clock：
+
+```go
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+func Expired(clock Clock, deadline time.Time) bool {
+	return clock.Now().After(deadline)
+}
+```
+
+测试：
+
+```go
+type fakeClock struct {
+	now time.Time
+}
+
+func (f fakeClock) Now() time.Time { return f.now }
+```
+
+这样边界时间、过期、未过期都能稳定测试。
+
+## 4. 函数参数注入适合简单依赖
+
+不是所有依赖都要抽接口。简单函数依赖可以直接传函数。
+
+```go
+func Retry(ctx context.Context, sleep func(time.Duration), fn func() error) error {
+	for i := 0; i < 3; i++ {
+		if err := fn(); err == nil {
+			return nil
+		}
+		sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("retry failed")
+}
+```
+
+测试里传空 sleep，避免真的等待。
+
+```go
+err := Retry(context.Background(), func(time.Duration) {}, func() error {
+	attempts++
+	if attempts < 2 {
+		return errors.New("fail")
+	}
+	return nil
+})
+```
+
+## 5. 全局变量会污染测试
+
+不推荐：
+
+```go
+var defaultClient = &http.Client{Timeout: time.Second}
+
+func Fetch(url string) error {
+	_, err := defaultClient.Get(url)
+	return err
+}
+```
+
+测试如果修改全局 client，可能影响其他测试，尤其是 `t.Parallel()`。
+
+更好的方式是结构体持有依赖：
+
+```go
+type Fetcher struct {
+	client *http.Client
+}
+
+func (f Fetcher) Fetch(ctx context.Context, url string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+```
+
+## 6. 不要过度抽象
+
+如果一个类型只有一个实现，测试也不需要替换它，不一定要先抽接口。
+
+```go
+type Calculator struct{}
+
+func (Calculator) Add(a, b int) int {
+	return a + b
+}
+```
+
+为它提前抽接口没有收益：
+
+```go
+type Calculator interface {
+	Add(int, int) int
+}
+```
+
+接口应该由真实替换需求驱动：外部依赖、复杂状态、慢操作、不可控时间、随机数、网络、数据库。
+
+## 7. 面试时怎么答
+
+可以这样回答：
+
+- 依赖注入的目标是让业务逻辑不直接依赖真实外部系统和全局状态。
+- Go 常用构造函数、接口、函数参数做显式注入。
+- 接口定义在使用方，并保持最小。
+- 时间、随机数、HTTP、数据库等不可控依赖要能替换。
+- 全局变量会让测试顺序相关，尽量避免。
+- 不要为了测试过度抽象，只有真实替换需求时才抽接口。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“可测试性”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- Go 为什么通常不需要复杂 DI 框架？
+- 接口应该定义在生产者还是使用者？
+- 时间相关逻辑怎么测试？
+- 如何避免测试依赖真实 HTTP 或数据库？
+- 什么时候不应该抽接口？

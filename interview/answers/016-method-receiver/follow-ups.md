@@ -1,60 +1,202 @@
 # 016. 值接收者和指针接收者 - 面试追问
 
-## 追问与参考答案
+## 1. 值接收者和指针接收者在修改字段时有什么区别？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+值接收者修改副本：
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type Counter struct {
+	N int
+}
 
-- 方法接收者本质上是函数的第一个参数。
-- T 的方法集只包含值接收者方法，*T 的方法集包含值接收者和指针接收者方法。
-- 接口实现检查方法集，因此只有 *T 可能实现了某个含指针接收者方法的接口。
-- 自动取地址只是调用语法糖，不改变方法集规则。
+func (c Counter) Inc() {
+	c.N++
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+c := Counter{}
+c.Inc()
+fmt.Println(c.N) // 0
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+指针接收者修改原对象：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+func (c *Counter) IncPtr() {
+	c.N++
+}
 
-- 需要修改接收者或避免复制大对象时用指针接收者。
-- 小的不可变值类型可以用值接收者，例如类似 time.Time 的语义。
-- 含 mutex、buffer、cache 等内部状态的类型应使用指针接收者。
-- 同一类型不要混用接收者，除非有非常清楚的理由。
+c := Counter{}
+c.IncPtr()
+fmt.Println(c.N) // 1
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+所以如果方法语义是“改变这个对象”，就应该用指针接收者。
 
-### 3. 这道题最容易追问哪些坑？
+## 2. 方法集规则如何影响接口实现？
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+规则是：
 
-- 值接收者方法里修改字段，以为会影响原对象。
-- 把 T 传给接口，结果只有 *T 实现接口。
-- 方法值绑定接收者时复制了值，后续原对象变化不影响已绑定方法值。
-- 为性能盲目改指针接收者，导致共享可变状态扩大。
+- `T` 的方法集包含值接收者方法。
+- `*T` 的方法集包含值接收者和指针接收者方法。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+type Flusher interface {
+	Flush() error
+}
 
-### 4. 如何证明你的判断是对的？
+type Buffer struct{}
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+func (b *Buffer) Flush() error {
+	return nil
+}
 
-- 写编译期断言 `var _ Interface = (*T)(nil)` 验证接口实现。
-- 写测试区分值接收者修改副本和指针接收者修改原对象。
-- 用 benchmark 评估大结构体值接收者复制成本。
+var _ Flusher = (*Buffer)(nil) // 正确
+// var _ Flusher = Buffer{}    // 编译错误
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+因为 `Flush` 是 `*Buffer` 的方法，不是 `Buffer` 方法集里的方法。
 
-### 5. 当规模变大后，这个问题会如何升级？
+如果 `Flush` 改成值接收者：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+func (b Buffer) Flush() error {
+	return nil
+}
+```
 
-- 小类型里接收者选择主要影响语义清晰度。
-- 大型服务中，接口边界多，方法集规则会直接影响依赖注入和 mock。
-- 并发类型中接收者选择错误可能引入数据竞争或锁复制。
+那么 `Buffer` 和 `*Buffer` 都实现 `Flusher`。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+## 3. 为什么 `b.Write()` 能调用，但 `Use(b)` 不能通过接口检查？
 
-### 6. 初学者应该怎么把这个问题学扎实？
+因为可寻址变量调用指针接收者方法时，编译器可以自动取地址：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+var b Buffer
+b.Write([]byte("go")) // 等价于 (&b).Write(...)
+```
+
+但接口赋值检查看的是方法集，不会因为 `b` 可寻址就把 `Buffer` 当成 `*Buffer`。
+
+```go
+type Writer interface {
+	Write([]byte) (int, error)
+}
+
+func Use(w Writer) {}
+
+var b Buffer
+// Use(b) // 编译错误
+Use(&b)   // 正确
+```
+
+一句话：自动取地址是调用语法糖，不改变接口实现规则。
+
+## 4. 含锁结构体为什么应该用指针接收者？
+
+因为值接收者会复制锁。
+
+```go
+type SafeCounter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c SafeCounter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+这段代码锁住的是副本，原对象没有被正确保护和修改。
+
+正确写法：
+
+```go
+func (c *SafeCounter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+可以用工具辅助：
+
+```sh
+go vet -copylocks ./...
+```
+
+## 5. 方法值绑定接收者时会发生什么？
+
+方法值会保存接收者。
+
+值接收者保存副本：
+
+```go
+type User struct {
+	Name string
+}
+
+func (u User) Hello() string {
+	return u.Name
+}
+
+u := User{Name: "Tom"}
+hello := u.Hello
+
+u.Name = "Jerry"
+
+fmt.Println(hello())  // Tom
+fmt.Println(u.Hello()) // Jerry
+```
+
+指针接收者保存指针：
+
+```go
+func (u *User) PtrHello() string {
+	return u.Name
+}
+
+u := User{Name: "Tom"}
+hello := u.PtrHello
+
+u.Name = "Jerry"
+
+fmt.Println(hello()) // Jerry
+```
+
+在回调、goroutine、`defer` 中保存方法值时，这个差异很重要。
+
+## 6. 同一个类型能不能混用值接收者和指针接收者？
+
+语法上可以，但要谨慎。
+
+```go
+type User struct {
+	Name string
+}
+
+func (u User) DisplayName() string {
+	return u.Name
+}
+
+func (u *User) Rename(name string) {
+	u.Name = name
+}
+```
+
+这种小类型可以解释得通：读方法值接收者，写方法指针接收者。
+
+但如果类型明显是可变对象，或者有锁、缓存、连接等状态，建议统一指针接收者：
+
+```go
+type Store struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (s *Store) Get(key string) string { return s.m[key] }
+func (s *Store) Set(key, value string) { s.m[key] = value }
+```
+
+统一接收者能减少方法集意外，也让接口实现更容易预测。

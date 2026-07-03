@@ -1,60 +1,165 @@
 # 067. 结构体嵌入 - 面试追问
 
-## 追问与参考答案
+## 1. 为什么说嵌入不是继承？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为外层类型和内层类型仍然是两个独立类型，不能互相替代。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type User struct {
+	Name string
+}
 
-- 匿名字段的类型名会作为字段名，外层可以通过短选择器访问其字段和方法。
-- 提升不改变实际内存结构，也不建立子类关系。
-- 外层类型的方法集可能包含被提升的方法，从而实现某些接口。
-- 当多个嵌入字段提供同名成员时，选择器可能变得歧义，必须显式指定路径。
+type Admin struct {
+	User
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+func needUser(u User) {}
 
-### 2. 这个知识点在真实项目里怎么取舍？
+func main() {
+	a := Admin{User: User{Name: "alice"}}
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+	// needUser(a) // 编译失败
+	needUser(a.User)
+}
+```
 
-- 用嵌入复用小而稳定的行为，例如组合锁、日志器或基础能力。
-- 对外 API 谨慎暴露匿名字段，避免把内部实现提升成公共接口。
-- 需要明确领域关系时，普通命名字段比匿名嵌入更清晰。
-- 接口实现依赖方法提升时，要写编译期断言。
+继承通常意味着子类可以替代父类。Go 的嵌入只提供组合和选择器提升，不提供这种类型替代关系。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. 方法提升会不会让外层类型实现接口？
 
-### 3. 这道题最容易追问哪些坑？
+会。外层类型的方法集可能包含嵌入字段提升上来的方法。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+type Runner interface {
+	Run() error
+}
 
-- 把嵌入理解成继承，误以为外层可以替代内层类型。
-- 嵌入导出类型后，无意暴露大量内层方法。
-- 字段名冲突导致访问歧义或读者误解。
-- 嵌入含锁结构体后复制外层值，触发 copylocks 问题。
+type Worker struct{}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+func (Worker) Run() error {
+	return nil
+}
 
-### 4. 如何证明你的判断是对的？
+type Service struct {
+	Worker
+}
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+var _ Runner = Service{}
+```
 
-- 写小例子验证外层类型不能赋值给内层类型变量。
-- 用编译期断言检查方法提升是否让外层实现接口。
-- 用 `go vet -copylocks` 检查嵌入锁后的复制风险。
+如果嵌入的是指针类型，方法集还要结合值类型和指针类型判断。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+type Worker struct{}
 
-### 5. 当规模变大后，这个问题会如何升级？
+func (*Worker) Run() error {
+	return nil
+}
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+type Service struct {
+	*Worker
+}
 
-- 小结构体中嵌入能减少样板代码。
-- 公共库中过度嵌入会让 API 面积膨胀，后续难以收回。
-- 大型项目更应把组合关系表达清楚，避免继承式思维。
+var _ Runner = Service{}  // 可以：Service 含有 *Worker 嵌入字段
+var _ Runner = &Service{} // 也可以
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+真实项目里，如果依赖提升方法实现接口，最好写编译期断言，避免后续改字段时悄悄破坏实现关系。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+## 3. 字段名冲突时 Go 怎么处理？
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+Go 不会猜，短选择器会报歧义。
+
+```go
+type ConfigA struct {
+	Timeout int
+}
+
+type ConfigB struct {
+	Timeout int
+}
+
+type App struct {
+	ConfigA
+	ConfigB
+}
+
+func main() {
+	app := App{}
+
+	// _ = app.Timeout // ambiguous selector
+	_ = app.ConfigA.Timeout
+	_ = app.ConfigB.Timeout
+}
+```
+
+如果两个字段表达的是不同业务概念，用普通命名字段往往更清楚。
+
+```go
+type App struct {
+	readConfig  ConfigA
+	writeConfig ConfigB
+}
+```
+
+## 4. 什么时候应该用嵌入，什么时候应该用普通字段？
+
+适合嵌入：外层确实想暴露内层的行为，并且这个行为稳定、很小。
+
+```go
+type BufferLogger struct {
+	bytes.Buffer
+}
+
+func (b *BufferLogger) Log(s string) {
+	b.WriteString(s)
+	b.WriteByte('\n')
+}
+```
+
+不适合嵌入：内层只是实现细节，不希望调用方直接使用。
+
+```go
+type Service struct {
+	client *http.Client // 命名字段，不把 client 的方法提升出去
+}
+```
+
+判断标准：调用方是否应该知道并直接使用内层能力。如果不应该，就不要嵌入。
+
+## 5. 为什么嵌入 `sync.Mutex` 后不能随便复制结构体？
+
+锁的状态被复制后，两个结构体会持有两个锁状态，但它们可能保护同一份或本应同一份数据，语义会混乱。
+
+```go
+type Counter struct {
+	sync.Mutex
+	n int
+}
+
+func main() {
+	c1 := Counter{}
+	c1.Lock()
+
+	c2 := c1 // 复制了已经使用过的 Mutex
+
+	c1.Unlock()
+	_ = c2
+}
+```
+
+正确做法是使用指针传递含锁对象，不在使用后复制它。
+
+```go
+func inc(c *Counter) {
+	c.Lock()
+	defer c.Unlock()
+	c.n++
+}
+```
+
+可以用工具辅助检查：
+
+```bash
+go vet -copylocks ./...
+```

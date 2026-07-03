@@ -1,60 +1,240 @@
 # 012. 包、可见性和 init - 面试追问
 
-## 追问与参考答案
+## 1. 包外可见性为什么只看首字母？结构体字段也一样吗？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+Go 用标识符首字母决定是否导出。大写导出，小写不导出。结构体字段、函数、类型、变量、常量、方法都一样。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+package user
 
-- Go 以包为编译和封装单元，同一目录通常只能有一个普通包名。
-- 包级变量按文件顺序和依赖关系初始化，然后执行该包的 init 函数。
-- 一个包可以有多个 init，它们不能被显式调用，也没有参数和返回值。
-- 空白导入会执行被导入包的初始化逻辑，但不会直接引用其导出标识符。
+type User struct {
+	ID   int64
+	name string
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+func New(id int64, name string) User {
+	return User{ID: id, name: name}
+}
 
-### 2. 这个知识点在真实项目里怎么取舍？
+func (u User) Name() string {
+	return u.name
+}
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+包外代码只能访问导出的 `ID` 和 `Name`：
 
-- 导出 API 要小而稳定，未必要把所有类型和字段都暴露出去。
-- init 适合驱动注册、插件注册等必须在导入时发生的副作用。
-- 需要可测试、可配置的初始化逻辑时，优先显式构造函数而不是 init。
-- 包之间出现循环依赖时，通常说明抽象边界需要调整。
+```go
+u := user.New(1, "Tom")
+fmt.Println(u.ID)
+fmt.Println(u.Name())
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+// fmt.Println(u.name) // 编译错误
+```
 
-### 3. 这道题最容易追问哪些坑？
+面试里可以补一句：未导出字段常用于保护不变量，调用方只能通过方法访问，包内部仍然可以自由调整实现。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+## 2. 包初始化顺序具体是什么？
 
-- 把复杂业务启动逻辑放进 init，导致测试难控制、错误难返回。
-- 为了使用副作用导入却忘记写 `_`，或写了 `_` 但不知道副作用来自哪里。
-- 包名和目录名混乱，降低可读性。
-- 导出过多内部细节，使后续重构成本变高。
+顺序是：依赖包先初始化，当前包后初始化；同一个包内先初始化包级变量，再执行 `init`。
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+package a
 
-### 4. 如何证明你的判断是对的？
+import "fmt"
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+var X = initX()
 
-- 写小包验证变量初始化和 init 的执行顺序。
-- 用 `go list -deps` 观察依赖图。
-- 在测试中避免依赖 init 的隐式全局状态，必要时提供 reset 或显式构造。
+func initX() int {
+	fmt.Println("a var")
+	return 1
+}
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+func init() {
+	fmt.Println("a init")
+}
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+package main
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+import (
+	"fmt"
+	"example.com/app/a"
+)
 
-- 项目小的时候包边界问题不明显。
-- 代码量上来后，包可见性和依赖方向直接影响重构成本。
-- 平台型项目里，init 注册机制要配合文档和约定，否则很难追踪行为来源。
+var Y = initY()
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+func initY() int {
+	fmt.Println("main var")
+	return 2
+}
 
-### 6. 初学者应该怎么把这个问题学扎实？
+func init() {
+	fmt.Println("main init", a.X)
+}
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+func main() {
+	fmt.Println("main")
+}
+```
+
+输出顺序会是：
+
+```text
+a var
+a init
+main var
+main init 1
+main
+```
+
+核心规则：`main.main` 是最后才开始执行的。
+
+## 3. 一个包里多个 `init` 有什么限制和风险？
+
+限制：
+
+- 不能显式调用。
+- 不能带参数。
+- 不能返回值。
+- 一个包里可以有多个。
+
+```go
+func init() {
+	register("json")
+}
+
+func init() {
+	register("xml")
+}
+```
+
+风险是初始化逻辑分散，读代码时很难看出导入一个包到底发生了什么。
+
+如果初始化可能失败，`init` 也不适合：
+
+```go
+func init() {
+	if err := loadConfig(); err != nil {
+		panic(err)
+	}
+}
+```
+
+更好的方式是显式返回错误：
+
+```go
+func NewApp(path string) (*App, error) {
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		return nil, err
+	}
+	return &App{Config: cfg}, nil
+}
+```
+
+## 4. 空白导入 `_` 的真实用途是什么？
+
+空白导入表示只需要这个包的初始化副作用，不直接引用它的名字。
+
+```go
+import (
+	"database/sql"
+
+	_ "github.com/lib/pq"
+)
+
+db, err := sql.Open("postgres", dsn)
+```
+
+`github.com/lib/pq` 被导入后，它的 `init` 会注册 postgres 驱动。业务代码调用的是 `database/sql`，所以没有直接使用 `pq` 包名。
+
+如果忘记空白导入，可能会出现运行时错误：
+
+```text
+sql: unknown driver "postgres"
+```
+
+面试回答要强调：`_` 不是“消除未使用 import 报错”的技巧，而是在声明“我需要这个包的副作用”。
+
+## 5. 为什么复杂业务初始化不建议放进 `init`？
+
+因为 `init` 没有参数和返回值，导入包就自动执行，测试和错误处理都不清晰。
+
+不推荐：
+
+```go
+var db *sql.DB
+
+func init() {
+	var err error
+	db, err = sql.Open("mysql", os.Getenv("DSN"))
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+问题：
+
+- 配置来源被隐藏。
+- 测试很难注入临时数据库或 fake。
+- 初始化失败只能 panic。
+- 只要导入包就产生连接副作用。
+
+推荐：
+
+```go
+type Store struct {
+	db *sql.DB
+}
+
+func NewStore(dsn string) (*Store, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+```
+
+这样调用方能决定什么时候初始化、如何处理错误、测试时如何替换。
+
+## 6. import cycle 出现时，通常应该怎么拆包？
+
+循环依赖通常说明包边界不清楚。
+
+错误结构：
+
+```text
+user   -> order
+order  -> user
+```
+
+如果两个包只是共享基础类型，可以抽到更底层的包：
+
+```text
+domain -> 定义 User、Order、ID 等基础类型
+user   -> 导入 domain
+order  -> 导入 domain
+```
+
+如果是两个服务互相调用，通常应该让更高层负责编排：
+
+```text
+app    -> 导入 user 和 order，组合业务流程
+user   -> 不导入 order
+order  -> 不导入 user
+```
+
+如果只是为了使用一个小接口，可以把接口放在使用方一侧：
+
+```go
+package order
+
+type UserGetter interface {
+	GetUser(id int64) (User, error)
+}
+```
+
+Go 里接口隐式实现，很多循环依赖都可以通过“接口放在消费方”来拆开。

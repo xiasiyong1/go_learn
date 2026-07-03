@@ -1,60 +1,141 @@
 # 084. 可测试性 - 面试追问
 
-## 追问与参考答案
+## 1. Go 为什么通常不需要复杂 DI 框架？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为 Go 的依赖关系用结构体字段和构造函数就能表达清楚。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type Service struct {
+	repo   UserRepo
+	mailer Mailer
+}
 
-- 构造函数把依赖集中传入，形成清晰的对象生命周期。
-- 接口让测试可以提供 fake 或 mock 实现。
-- 函数参数注入适合简单依赖，例如时间函数、随机数或回调。
-- 全局状态会让测试之间相互影响，导致顺序相关和并发问题。
+func NewService(repo UserRepo, mailer Mailer) *Service {
+	return &Service{repo: repo, mailer: mailer}
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+调用方一眼能看到 Service 依赖什么。复杂框架可能把依赖隐藏在运行时容器里，反而不利于初学者理解和排查。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+大型项目可以使用生成式工具减少装配样板，但核心仍然是显式依赖关系，而不是魔法注入。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+## 2. 接口应该定义在生产者还是使用者？
 
-- 业务服务结构体通过构造函数接收 repository、client、logger、clock 等依赖。
-- 接口定义在使用方，保持方法最小。
-- 对时间、随机数和外部调用提供可替换依赖。
-- 不要为了测试把所有东西都抽象成接口，先看是否真的需要替换。
+多数情况下定义在使用者侧。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+使用者只需要一个方法：
 
-### 3. 这道题最容易追问哪些坑？
+```go
+type UserFinder interface {
+	FindUser(ctx context.Context, id string) (User, error)
+}
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+真实 repository 可以有很多方法：
 
-- 业务代码直接调用全局 client，测试只能打真实依赖。
-- 接口过大，fake 实现成本很高。
-- 测试修改全局变量后没有恢复，影响其他测试。
-- 引入复杂 DI 框架，掩盖简单依赖关系。
+```go
+type MySQLUserRepo struct{}
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+func (r *MySQLUserRepo) FindUser(ctx context.Context, id string) (User, error) { return User{}, nil }
+func (r *MySQLUserRepo) CreateUser(ctx context.Context, u User) error { return nil }
+func (r *MySQLUserRepo) DeleteUser(ctx context.Context, id string) error { return nil }
+```
 
-### 4. 如何证明你的判断是对的？
+使用者不应该被迫依赖 `CreateUser`、`DeleteUser`。接口越贴近使用者，测试 fake 越小。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+## 3. 时间相关逻辑怎么测试？
 
-- 为业务逻辑写不依赖网络和数据库的单元测试。
-- 使用 fake 验证错误路径、超时和边界条件。
-- 并行运行测试，检查是否存在共享全局状态污染。
+不要在业务逻辑里直接调用 `time.Now()`，把 clock 注入进去。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+type Clock interface {
+	Now() time.Time
+}
 
-### 5. 当规模变大后，这个问题会如何升级？
+func IsExpired(clock Clock, deadline time.Time) bool {
+	return !clock.Now().Before(deadline)
+}
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+测试：
 
-- 小项目手写构造函数足够。
-- 模块增多后，显式依赖关系能降低维护成本。
-- 大型服务可以使用生成式注入工具，但核心仍是清晰的依赖边界。
+```go
+type fakeClock struct{ now time.Time }
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+func (f fakeClock) Now() time.Time { return f.now }
 
-### 6. 初学者应该怎么把这个问题学扎实？
+func TestIsExpired(t *testing.T) {
+	now := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	deadline := now.Add(-time.Second)
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+	if !IsExpired(fakeClock{now: now}, deadline) {
+		t.Fatal("want expired")
+	}
+}
+```
+
+这样测试不会受真实时间影响，也不需要 sleep。
+
+## 4. 如何避免测试依赖真实 HTTP 或数据库？
+
+HTTP 可以用接口或 `httptest`。
+
+接口方式：
+
+```go
+type Doer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type API struct {
+	client Doer
+}
+```
+
+`httptest` 方式：
+
+```go
+srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"ok":true}`))
+}))
+defer srv.Close()
+```
+
+数据库可以把 repository 抽成小接口，单元测试用 fake；集成测试再连真实数据库，并用 build tag 或单独测试环境隔离。
+
+## 5. 什么时候不应该抽接口？
+
+没有替换需求时，不要为了“看起来可测试”提前抽接口。
+
+不必要：
+
+```go
+type Adder interface {
+	Add(int, int) int
+}
+
+type Calculator struct{}
+
+func (Calculator) Add(a, b int) int { return a + b }
+```
+
+直接测试具体类型更简单：
+
+```go
+func TestAdd(t *testing.T) {
+	c := Calculator{}
+	if got := c.Add(1, 2); got != 3 {
+		t.Fatal(got)
+	}
+}
+```
+
+适合抽接口的场景：
+
+- 网络、数据库、文件系统等外部依赖。
+- 时间、随机数等不稳定依赖。
+- 慢操作或错误路径难构造的依赖。
+- 多实现策略确实存在。
+
+接口是为了降低耦合，不是为了增加层数。

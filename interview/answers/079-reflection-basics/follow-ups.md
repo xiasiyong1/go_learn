@@ -1,60 +1,125 @@
 # 079. 反射 - 面试追问
 
-## 追问与参考答案
+## 1. `reflect.Type` 和 `reflect.Value` 分别解决什么问题？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+`Type` 解决“这个东西是什么类型”，`Value` 解决“这个东西当前是什么值”。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+u := User{Name: "alice"}
 
-- `reflect.TypeOf` 获取动态类型信息，`reflect.ValueOf` 获取运行时值表示。
-- 只有可寻址且可设置的 Value 才能通过反射修改。
-- 反射调用方法和字段访问会进行运行时检查，错误用 panic 表现的场景不少。
-- 反射通常伴随接口装箱、动态分派和额外分配。
+t := reflect.TypeOf(u)
+v := reflect.ValueOf(u)
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+fmt.Println(t.Name()) // User
+fmt.Println(v.FieldByName("Name").String()) // alice
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+如果你要读字段 tag，用 Type：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+field, _ := t.FieldByName("Name")
+fmt.Println(field.Tag.Get("json"))
+```
 
-- 框架层、序列化层和工具层可以使用反射。
-- 业务核心逻辑优先使用静态类型、接口或泛型。
-- 反射代码要把 panic 风险转成明确错误。
-- 反射结果可缓存时缓存 Type 元数据，降低重复解析成本。
+如果你要读或改字段值，用 Value。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. 为什么 `reflect.ValueOf(u).FieldByName(...).Set...` 会 panic？
 
-### 3. 这道题最容易追问哪些坑？
+因为 `ValueOf(u)` 得到的是传入接口里的副本，不是可设置的原始变量。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+u := User{Name: "alice"}
+v := reflect.ValueOf(u)
+f := v.FieldByName("Name")
 
-- 对不可设置 Value 调用 Set，运行时 panic。
-- 没有处理指针和值的差异，导致字段访问失败。
-- 通过反射绕开类型系统，让错误延迟到运行时。
-- 在高频路径大量使用反射，造成 CPU 和分配热点。
+fmt.Println(f.CanSet()) // false
+// f.SetString("bob")   // panic
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+要修改原值，传指针：
 
-### 4. 如何证明你的判断是对的？
+```go
+v := reflect.ValueOf(&u).Elem()
+f := v.FieldByName("Name")
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+fmt.Println(f.CanSet()) // true
+f.SetString("bob")
+```
 
-- 写测试覆盖指针、值、nil、未导出字段和类型不匹配。
-- 用 benchmark 比较反射实现和静态实现。
-- 用 pprof 确认反射是否是性能热点。
+面试时不要只说“要传指针”，还要说明为什么：反射必须拿到可寻址、可设置的原值。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+## 3. 反射如何安全处理指针和 nil？
 
-### 5. 当规模变大后，这个问题会如何升级？
+先判断 Kind，再判断 IsNil，最后 Elem。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+func asStructValue(x any) (reflect.Value, error) {
+	v := reflect.ValueOf(x)
+	if !v.IsValid() {
+		return reflect.Value{}, fmt.Errorf("nil value")
+	}
 
-- 小工具用反射可以减少重复代码。
-- 高频服务路径中反射成本可能明显。
-- 框架代码要把反射复杂度封装好，不能让业务层到处处理 reflect.Value。
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return reflect.Value{}, fmt.Errorf("nil pointer")
+		}
+		v = v.Elem()
+	}
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}, fmt.Errorf("expected struct")
+	}
+	return v, nil
+}
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+不要对不确定的值直接 `Elem()`：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+// reflect.ValueOf(123).Elem() // panic
+```
+
+## 4. struct tag 是谁解释的？
+
+tag 是结构体字段上的字符串元数据，编译器只保留它，不理解业务语义。
+
+```go
+type User struct {
+	Name string `json:"name" db:"user_name"`
+}
+
+t := reflect.TypeOf(User{})
+f, _ := t.FieldByName("Name")
+
+fmt.Println(f.Tag.Get("json")) // name
+fmt.Println(f.Tag.Get("db"))   // user_name
+```
+
+`encoding/json` 会解释 `json` tag，ORM 可能解释 `db` tag，校验库可能解释 `validate` tag。tag 写错通常不会编译失败，只会运行行为不符合预期。
+
+## 5. 反射和泛型分别适合什么场景？
+
+泛型适合“编译期知道类型集合，只是逻辑重复”的场景。
+
+```go
+func First[T any](s []T) (T, bool) {
+	if len(s) == 0 {
+		var zero T
+		return zero, false
+	}
+	return s[0], true
+}
+```
+
+反射适合“运行时才知道结构”的场景，比如读取任意结构体 tag。
+
+```go
+func PrintFields(x any) {
+	t := reflect.TypeOf(x)
+	for i := 0; i < t.NumField(); i++ {
+		fmt.Println(t.Field(i).Name)
+	}
+}
+```
+
+业务代码能用泛型或接口表达时，优先不用反射。反射更适合框架边界，不适合到处散落在业务逻辑里。

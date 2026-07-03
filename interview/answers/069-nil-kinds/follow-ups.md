@@ -1,60 +1,164 @@
 # 069. nil - 面试追问
 
-## 追问与参考答案
+## 1. nil slice 和 empty slice 在代码和 JSON 里有什么区别？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+代码里它们都可以 `len`、`range`、`append`。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+var a []int
+b := []int{}
 
-- nil 表示某些类型的零引用状态。
-- nil slice 可以 len、cap、range、append。
-- nil map 可以读和 delete，但写入会 panic。
-- nil channel 收发会永久阻塞，nil func 调用会 panic。
+fmt.Println(len(a), len(b)) // 0 0
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+a = append(a, 1)
+b = append(b, 1)
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+但它们和 nil 比较不同：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+var a []int
+b := []int{}
 
-- 用 `len(s) == 0` 判断切片是否为空集合。
-- 写 map 前确保已经 `make`。
-- select 中可以利用 nil channel 动态禁用 case，但要写得非常清楚。
-- 回调函数调用前判断 nil，或者提供空实现。
+fmt.Println(a == nil) // true
+fmt.Println(b == nil) // false
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+JSON 表现也不同：
 
-### 3. 这道题最容易追问哪些坑？
+```go
+var a []int
+b := []int{}
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+aj, _ := json.Marshal(a)
+bj, _ := json.Marshal(b)
 
-- 把所有 nil 类型当成同一种行为。
-- 对 nil map 写入。
-- select 中某个 channel 变 nil 后所有分支都不再就绪，造成死锁。
-- 把 nil 指针装进 interface 后判断接口不为 nil。
+fmt.Println(string(aj)) // null
+fmt.Println(string(bj)) // []
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+内部逻辑通常用 `len(s) == 0` 判断空集合；对外 API 要根据契约决定返回 `null` 还是 `[]`。
 
-### 4. 如何证明你的判断是对的？
+## 2. 为什么 nil map 不能写，但 nil slice 可以 append？
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+nil slice 的 `append` 会创建新的底层数组并返回新切片。
 
-- 写表格测试覆盖各种 nil 类型的读、写、调用行为。
-- 用 recover 测试 nil map 写和 nil func 调用的 panic。
-- 对接口 nil 判断写专门测试，避免 error 返回陷阱。
+```go
+var s []int
+s = append(s, 1)
+fmt.Println(s) // [1]
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+nil map 没有底层哈希表，赋值时没有地方放 key/value。
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+var m map[string]int
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+// m["x"] = 1 // panic
 
-- 初学阶段 nil 多是 panic 来源。
-- 服务代码中 nil 语义会影响 JSON、数据库 NULL、缓存 miss 和 API 兼容。
-- 公共接口需要明确 nil 是否是合法入参或返回值。
+m = make(map[string]int)
+m["x"] = 1
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+面试回答要强调：slice 的 append 返回新值，map 的赋值是对现有哈希表写入。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+## 3. nil channel 在 select 里有什么实际用途？
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+可以动态禁用某个 case。
+
+```go
+var out chan<- int
+if hasValue {
+	out = realOut
+}
+
+select {
+case out <- value:
+	hasValue = false
+case v := <-in:
+	value = v
+	hasValue = true
+}
+```
+
+当 `out == nil` 时，发送分支不会被选中。这个技巧常用于状态机式 select，但要写得清楚，否则很容易变成死锁。
+
+危险写法：
+
+```go
+var ch chan int
+
+select {
+case <-ch:
+	// 永远不会执行
+}
+```
+
+如果 select 里所有 case 都是 nil channel 且没有 default，就会永久阻塞。
+
+## 4. nil func 应该如何设计默认行为？
+
+如果回调是可选的，调用前判断 nil：
+
+```go
+type Hook func(error)
+
+func run(h Hook) {
+	if h != nil {
+		h(nil)
+	}
+}
+```
+
+如果回调在业务流程中一定会被调用，可以在构造阶段提供空函数，减少调用处判断。
+
+```go
+type Worker struct {
+	onDone func()
+}
+
+func NewWorker(onDone func()) Worker {
+	if onDone == nil {
+		onDone = func() {}
+	}
+	return Worker{onDone: onDone}
+}
+```
+
+不要直接调用 nil func：
+
+```go
+var f func()
+// f() // panic
+```
+
+## 5. 为什么 `var err error = (*MyErr)(nil)` 不等于 nil？
+
+接口值包含动态类型和动态值。下面的 `err` 有动态类型 `*MyErr`，所以接口本身不是 nil。
+
+```go
+type MyErr struct{}
+
+func (*MyErr) Error() string { return "bad" }
+
+func main() {
+	var e *MyErr = nil
+	var err error = e
+
+	fmt.Println(e == nil)   // true
+	fmt.Println(err == nil) // false
+}
+```
+
+正确的错误返回方式是没有错误时直接返回 nil 接口：
+
+```go
+func do(ok bool) error {
+	if ok {
+		return nil
+	}
+	return &MyErr{}
+}
+```
+
+这类问题在自定义 error、接口返回值和 mock 中非常常见。
