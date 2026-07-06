@@ -1,60 +1,212 @@
 # 031. select、超时和取消 - 面试追问
 
-## 追问与参考答案
+## 1. `select` 在多个 case 同时 ready 时如何选择？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+会伪随机选择一个 ready case，不能依赖源码顺序。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+ch1 := make(chan int, 1)
+ch2 := make(chan int, 1)
+ch1 <- 1
+ch2 <- 2
 
-- select 只关心 channel 操作是否可以立即进行。
-- default 会让 select 非阻塞，使用不当会形成忙轮询。
-- nil channel 可用来动态关闭某个 case，而不必额外分支。
-- `time.After` 每次调用会创建 timer，循环中使用要注意分配和资源。
+select {
+case <-ch1:
+	fmt.Println("ch1")
+case <-ch2:
+	fmt.Println("ch2")
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+如果业务需要优先级，要显式写逻辑，而不是依赖 case 顺序。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+select {
+case v := <-high:
+	handle(v)
+default:
+	select {
+	case v := <-high:
+		handle(v)
+	case v := <-low:
+		handle(v)
+	}
+}
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+这种优先级代码要写测试，否则很容易引入饥饿或漏处理。
 
-- 请求级取消优先使用 context。
-- 单次超时可以用 `time.After`，循环或高频路径优先复用 Timer。
-- 需要退出循环时，在每个可能阻塞的 select 中监听 done 或 ctx.Done。
-- default 只用于明确的非阻塞尝试，不能作为避免阻塞的万能方案。
+## 2. `default` 有什么作用，为什么可能导致忙轮询？
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+`default` 让 select 在没有 case ready 时立即返回。
 
-### 3. 这道题最容易追问哪些坑？
+```go
+select {
+case v := <-ch:
+	return v
+default:
+	return zero
+}
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+适合非阻塞尝试。
 
-- select 加 default 后疯狂空转，占满 CPU。
-- 循环里反复 `time.After`，制造大量 timer 分配。
-- 忽略 ctx.Done，导致上游取消后 goroutine 仍阻塞。
-- 依赖多个 ready case 的选择顺序。
+错误用法：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+for {
+	select {
+	case job := <-jobs:
+		handle(job)
+	default:
+	}
+}
+```
 
-### 4. 如何证明你的判断是对的？
+没有 job 时循环不停空转，会吃 CPU。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+如果想等待任务，不要写 default：
 
-- 写测试用短 timeout 验证函数是否按时返回。
-- 用 benchmark 比较循环中 `time.After` 和复用 Timer 的分配。
-- 用 goroutine profile 检查取消后是否还有阻塞在 select 的 goroutine。
+```go
+for {
+	select {
+	case job := <-jobs:
+		handle(job)
+	case <-ctx.Done():
+		return
+	}
+}
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+## 3. 单次超时和循环超时分别应该怎么写？
 
-### 5. 当规模变大后，这个问题会如何升级？
+单次等待可以用 `time.After`：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+select {
+case result := <-resultCh:
+	return result, nil
+case <-time.After(time.Second):
+	return Result{}, fmt.Errorf("timeout")
+}
+```
 
-- 简单并发控制中 select 可读性很高。
-- 高频循环和低延迟场景中，timer 分配和 default 忙轮询会变成性能问题。
-- 复杂状态机里，可以用 nil channel 控制 case 开关，但要保持代码可读。
+循环周期任务用 ticker：
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+ticker := time.NewTicker(time.Second)
+defer ticker.Stop()
 
-### 6. 初学者应该怎么把这个问题学扎实？
+for {
+	select {
+	case job := <-jobs:
+		handle(job)
+	case <-ticker.C:
+		report()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+请求级超时优先用 context，把同一个 deadline 传到下游：
+
+```go
+ctx, cancel := context.WithTimeout(parent, time.Second)
+defer cancel()
+
+return call(ctx)
+```
+
+## 4. 为什么循环里反复 `time.After` 要谨慎？
+
+`time.After` 每次调用都会创建 timer。
+
+```go
+for {
+	select {
+	case <-time.After(time.Millisecond):
+		tick()
+	case <-ctx.Done():
+		return
+	}
+}
+```
+
+高频循环里会产生额外分配和 timer 管理成本。
+
+如果是周期任务，用 ticker：
+
+```go
+ticker := time.NewTicker(time.Millisecond)
+defer ticker.Stop()
+
+for {
+	select {
+	case <-ticker.C:
+		tick()
+	case <-ctx.Done():
+		return
+	}
+}
+```
+
+如果是每次操作独立 deadline，可以创建并复用 `Timer`，但要正确处理 Stop 和 drain，代码复杂度更高。
+
+## 5. nil channel 在 `select` 里有什么用途？
+
+nil channel 永远不会 ready，所以可以用来动态禁用 case。
+
+```go
+for ch1 != nil || ch2 != nil {
+	select {
+	case v, ok := <-ch1:
+		if !ok {
+			ch1 = nil
+			continue
+		}
+		handle(v)
+	case v, ok := <-ch2:
+		if !ok {
+			ch2 = nil
+			continue
+		}
+		handle(v)
+	}
+}
+```
+
+如果不把关闭的 channel 设为 nil，后续接收会一直立即返回零值和 `ok=false`，可能导致循环异常。
+
+## 6. 如何保证取消信号不会被阻塞点漏掉？
+
+每个可能阻塞的发送、接收、I/O 都要考虑 context。
+
+发送可能阻塞：
+
+```go
+select {
+case out <- result:
+case <-ctx.Done():
+	return ctx.Err()
+}
+```
+
+接收可能阻塞：
+
+```go
+select {
+case job := <-jobs:
+	handle(job)
+case <-ctx.Done():
+	return ctx.Err()
+}
+```
+
+外部调用也要传 context：
+
+```go
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+```
+
+只在最外层创建 context，但内部阻塞点不监听，取消不会真正生效。

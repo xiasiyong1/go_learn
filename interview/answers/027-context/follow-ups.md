@@ -1,60 +1,190 @@
 # 027. context - 面试追问
 
-## 追问与参考答案
+## 1. context 取消后 goroutine 会自动退出吗？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+不会。context 只是取消信号，goroutine 必须主动监听。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+错误示例：
 
-- context 构成树状结构，父 context 取消会传播给子 context。
-- `Done()` 返回 channel，关闭表示取消或超时发生。
-- `Err()` 可以区分 `Canceled` 和 `DeadlineExceeded`。
-- context value 适合请求范围的元数据，不适合传业务参数或可选配置。
+```go
+func Start(ctx context.Context) {
+	go func() {
+		for {
+			doWork()
+		}
+	}()
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+外部调用 `cancel()` 后，这个 goroutine 仍然继续跑。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+正确写法：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+func Start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				doWork()
+			}
+		}
+	}()
+}
+```
 
-- 入口层创建带超时或取消的 context，向下游传递。
-- 启动 goroutine 时把 context 传进去，并在 select 中监听 `ctx.Done()`。
-- 使用 `defer cancel()` 释放资源，即使函数正常返回也要调用。
-- 日志 trace id、用户认证信息等可以放 value，但要用自定义 key 类型。
+如果 `doWork` 自己会阻塞，也要让它接收 context：
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+func Start(ctx context.Context) {
+	go func() {
+		for {
+			if err := doWork(ctx); err != nil {
+				return
+			}
+		}
+	}()
+}
+```
 
-### 3. 这道题最容易追问哪些坑？
+## 2. 为什么创建 `WithTimeout` 后仍然要调用 `cancel()`？
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+因为 `WithTimeout` 内部会创建 timer 和子 context。调用 `cancel()` 可以及时释放相关资源，并通知子 context。
 
-- 把 context 存进结构体长期持有。
-- 忘记 cancel，导致 timer 和子 context 资源延迟释放。
-- 把业务必填参数塞进 context value，破坏函数签名清晰度。
-- 认为 context 取消后正在执行的代码会被强制中断。
+```go
+ctx, cancel := context.WithTimeout(parent, time.Second)
+defer cancel()
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+return call(ctx)
+```
 
-### 4. 如何证明你的判断是对的？
+即使 `call` 很快返回，也应该 `defer cancel()`。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+不推荐：
 
-- 写测试构造超时 context，确认函数及时返回。
-- 用 goroutine 泄漏测试检查取消后后台任务是否退出。
-- 在日志中输出 `ctx.Err()`，区分主动取消和超时。
+```go
+ctx, _ := context.WithTimeout(parent, time.Second)
+return call(ctx)
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+这会让 timer 直到超时或父 context 取消才释放。
 
-### 5. 当规模变大后，这个问题会如何升级？
+## 3. `context.Canceled` 和 `context.DeadlineExceeded` 有什么区别？
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+`context.Canceled` 表示被主动取消。
 
-- 简单函数不需要为了形式主义添加 context。
-- 跨网络、数据库、队列和 goroutine 的调用链必须传递 context。
-- 系统规模变大后，统一的 deadline 传播是防止级联阻塞的基础。
+```go
+ctx, cancel := context.WithCancel(context.Background())
+cancel()
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+fmt.Println(ctx.Err()) // context canceled
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+`context.DeadlineExceeded` 表示超过 deadline 或 timeout。
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+defer cancel()
+
+<-ctx.Done()
+fmt.Println(ctx.Err()) // context deadline exceeded
+```
+
+真实服务里两者含义不同：客户端断开、上游主动取消通常是 canceled；依赖慢、处理超时通常是 deadline exceeded。
+
+## 4. 为什么不建议把 context 存进结构体？
+
+因为 context 是请求范围的。不同请求应该有不同的超时、取消、trace 信息。
+
+不推荐：
+
+```go
+type Client struct {
+	ctx context.Context
+}
+
+func (c *Client) Get(url string) error {
+	req, _ := http.NewRequestWithContext(c.ctx, http.MethodGet, url, nil)
+	_, err := http.DefaultClient.Do(req)
+	return err
+}
+```
+
+推荐：
+
+```go
+type Client struct{}
+
+func (c *Client) Get(ctx context.Context, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	_, err = http.DefaultClient.Do(req)
+	return err
+}
+```
+
+结构体保存依赖，方法参数传 context。这个边界更清楚。
+
+## 5. `context.Value` 适合放什么，不适合放什么？
+
+适合放请求范围元数据，例如 trace id、request id、认证结果。
+
+```go
+type requestIDKey struct{}
+
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDKey{}, id)
+}
+```
+
+不适合放业务必填参数：
+
+```go
+func Pay(ctx context.Context) error {
+	orderID := ctx.Value("order_id").(int64) // 不推荐
+	_ = orderID
+	return nil
+}
+```
+
+业务参数应该显式传：
+
+```go
+func Pay(ctx context.Context, orderID int64) error {
+	return nil
+}
+```
+
+这样调用方、测试和静态检查都更清楚。
+
+## 6. 如何写一个支持取消的 worker？
+
+要在所有阻塞点监听 `ctx.Done()`。
+
+```go
+func Worker(ctx context.Context, jobs <-chan Job, results chan<- Result) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+
+			result, err := handle(ctx, job)
+			select {
+			case results <- Result{Value: result, Err: err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+```
+
+这里接收 job 和发送 result 都可能阻塞，所以两个地方都要考虑取消。

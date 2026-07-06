@@ -6,58 +6,163 @@
 
 ## 先给结论
 
-atomic 提供单个内存位置上的原子读写和同步语义，Mutex 提供临界区保护。atomic 适合简单状态和计数，不适合维护复杂不变量。
+`sync/atomic` 适合对单个变量做简单、独立的并发读写，比如计数器、开关、状态位、只读配置指针替换。
 
-## 深入理解
+`sync.Mutex` 适合保护一段临界区，尤其是多个字段必须一起读写、必须维护业务不变量时。
 
-### 1. 这道题真正考察什么
+经验是：能用锁清楚表达正确性时，先用锁。只有在热点路径里确认锁竞争明显，并且状态足够简单时，再考虑 atomic。
 
-- 是否知道 atomic 操作避免数据竞争，但不会自动保证业务逻辑正确。
-- 是否能判断一个不变量是否跨多个字段。
-- 是否理解原子操作的内存可见性语义。
-- 是否能解释为什么 Mutex 往往更容易写对。
-
-### 2. 底层机制要讲清楚
-
-- atomic 操作对单个变量提供不可分割的读改写。
-- 多个原子变量之间没有天然事务关系，读取组合状态可能不一致。
-- Mutex 让临界区内多个字段的更新和读取保持一致。
-- Go 的 atomic 类型和函数提供同步语义，读写双方都要使用 atomic 才成立。
-
-### 3. 工程实践怎么取舍
-
-- 计数器、开关、状态位、只读配置指针替换适合 atomic。
-- 多个字段必须一起变化时，用 Mutex。
-- 优先选择可读、可证明正确的锁方案，再根据 profiling 考虑 atomic 优化。
-- 使用 `atomic.Int64` 等类型比散落函数调用更清晰。
-
-### 4. 常见误区
-
-- 用多个 atomic 变量维护复杂状态，读到中间态。
-- atomic 写，普通读，仍然是数据竞争。
-- 为了性能放弃锁，结果引入 ABA、重排理解错误或忙等。
-- 把 atomic 当成“无锁就一定快”。
-
-## 如何验证理解
-
-- 用 `go test -race` 验证所有访问路径都同步。
-- 写并发压力测试检查组合状态是否违反不变量。
-- 用 benchmark 比较锁和 atomic 在真实竞争程度下的表现。
-
-## 代码示例
+## atomic 计数器
 
 ```go
-var n atomic.Int64
-n.Add(1)
-fmt.Println(n.Load())
+type Metrics struct {
+	requests atomic.Int64
+}
+
+func (m *Metrics) Inc() {
+	m.requests.Add(1)
+}
+
+func (m *Metrics) Requests() int64 {
+	return m.requests.Load()
+}
 ```
+
+所有访问都要通过 atomic。如果一边 atomic 写，一边普通读，仍然是数据竞争。
+
+错误示例：
+
+```go
+var n int64
+
+func Inc() {
+	atomic.AddInt64(&n, 1)
+}
+
+func Read() int64 {
+	return n // 错误：普通读
+}
+```
+
+推荐使用 `atomic.Int64` 这类类型，避免散落的函数调用。
+
+## atomic 开关
+
+```go
+type Server struct {
+	closing atomic.Bool
+}
+
+func (s *Server) Close() {
+	s.closing.Store(true)
+}
+
+func (s *Server) Handle() error {
+	if s.closing.Load() {
+		return ErrClosing
+	}
+	return nil
+}
+```
+
+这类单个布尔状态很适合 atomic。
+
+## 多字段不变量用 Mutex
+
+错误方向：
+
+```go
+type Account struct {
+	balance atomic.Int64
+	frozen  atomic.Bool
+}
+
+func (a *Account) Withdraw(n int64) bool {
+	if a.frozen.Load() {
+		return false
+	}
+	if a.balance.Load() < n {
+		return false
+	}
+	a.balance.Add(-n)
+	return true
+}
+```
+
+这里 `frozen` 和 `balance` 之间没有事务关系。检查后到扣款前，状态可能被其他 goroutine 改掉。
+
+用锁更清楚：
+
+```go
+type Account struct {
+	mu      sync.Mutex
+	balance int64
+	frozen  bool
+}
+
+func (a *Account) Withdraw(n int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.frozen || a.balance < n {
+		return false
+	}
+	a.balance -= n
+	return true
+}
+```
+
+锁保护的是“冻结状态、余额检查、扣款”这个整体不变量。
+
+## 配置快照可以用 atomic.Value
+
+适合读多写少、整体替换不可变快照：
+
+```go
+type Config struct {
+	Timeout time.Duration
+	Limit   int
+}
+
+var current atomic.Value // stores Config
+
+func LoadConfig() Config {
+	return current.Load().(Config)
+}
+
+func UpdateConfig(cfg Config) {
+	current.Store(cfg)
+}
+```
+
+注意：存进去的配置最好视为不可变。如果里面有 map 或 slice，要复制后再 Store，避免读者看到被修改中的数据。
+
+## atomic 不等于一定快
+
+atomic 可以减少锁阻塞，但它也可能带来：
+
+- 忙等浪费 CPU。
+- 复杂内存可见性推理。
+- 多变量不一致。
+- 代码可读性下降。
+
+不推荐为了“无锁”写复杂循环：
+
+```go
+for !ready.Load() {
+	// busy wait
+}
+```
+
+更好的方式通常是 channel、cond、context 或 mutex，取决于场景。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“atomic 和 Mutex”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- atomic 适合哪些简单场景？
+- 为什么 atomic 写、普通读仍然有数据竞争？
+- 多个 atomic 变量能不能维护复杂不变量？
+- `atomic.Value` 适合什么场景？
+- 为什么 Mutex 往往更容易写对？
+- atomic 一定比 Mutex 快吗？

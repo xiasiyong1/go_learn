@@ -6,57 +6,191 @@ Go Module 的版本、replace 和 vendor 怎么理解？
 
 ## 先给结论
 
-Go Module 管理模块路径、语义化版本、依赖图和校验。深入理解要覆盖 minimal version selection、replace、vendor、indirect 和可复现构建。
+Go Module 管理模块路径、依赖版本、校验和构建输入。
 
-## 深入理解
+核心文件：
 
-### 1. 这道题真正考察什么
+- `go.mod`：声明模块路径、Go 版本、依赖版本、replace/exclude 等。
+- `go.sum`：记录依赖模块内容的校验哈希。
 
-- 是否知道 module path 是导入路径的一部分。
-- 是否理解语义化版本，尤其 v2+ 需要路径后缀。
-- 是否知道 `go.mod` 和 `go.sum` 的职责不同。
-- 是否能解释 `replace`、`exclude`、`vendor` 和 indirect。
+常见命令：
 
-### 2. 底层机制要讲清楚
+```sh
+go mod tidy
+go list -m all
+go mod why module/path
+go mod graph
+go mod vendor
+```
 
-- Go 使用 Minimal Version Selection，选择依赖图中要求的最低可用最高版本，而不是每次取最新。
-- `go.mod` 描述直接和间接依赖要求，`go.sum` 记录校验哈希。
-- v2 及以上主版本通常需要在 module path 中包含 `/v2`。
-- `replace` 只在当前主模块生效，用于本地开发、临时替换或 fork 修复。
+面试要讲清楚：语义化版本、v2+ 路径规则、Minimal Version Selection、`replace` 只对当前主模块生效、vendor 适合离线或固定供应链场景。
 
-### 3. 工程实践怎么取舍
+## go.mod 和 go.sum
 
-- 提交 `go.mod` 和 `go.sum`，保证团队构建一致。
-- 使用 `go mod tidy` 清理未使用依赖并补齐缺失依赖。
-- 本地联调可用 replace，但发布前要确认是否应该移除。
-- 需要离线或供应链固定时使用 vendor，并明确构建参数。
+示例：
 
-### 4. 常见误区
+```go
+module example.com/app
 
-- 误删 go.sum，导致校验和重新变化或 CI 失败。
-- 在库模块中提交临时 replace，影响使用者预期。
-- 升级 v2 依赖但导入路径没改，导致版本不符合规范。
-- 看到 indirect 就手动删除，未理解它可能是测试或间接依赖需要。
+go 1.22
 
-## 如何验证理解
+require github.com/gin-gonic/gin v1.10.0
+```
 
-- 用 `go list -m all` 查看最终模块版本。
-- 用 `go mod why` 分析某依赖为什么被引入。
-- 用 `go mod graph` 查看依赖图。
-- 用干净环境跑构建，验证 replace/vendor 假设。
+`go.mod` 表示项目需要哪些模块和版本约束。
 
-## 代码示例
+`go.sum` 不是“依赖列表”，而是校验文件。它记录下载过的模块内容哈希，用于验证依赖没有被篡改。
+
+不要随便删除 `go.sum`。团队项目通常应该提交 `go.mod` 和 `go.sum`。
+
+## indirect 是什么
+
+```go
+require golang.org/x/text v0.14.0 // indirect
+```
+
+`indirect` 表示当前模块没有直接 import 它，但依赖图里需要它。它可能来自：
+
+- 直接依赖的依赖。
+- 测试依赖。
+- 某些包的工具依赖。
+
+不要看到 `indirect` 就手删。用：
+
+```sh
+go mod tidy
+```
+
+让工具根据源码 import 自动整理。
+
+## v2+ 路径规则
+
+Go Module 的 v2 及以上主版本通常要体现在 module path 里：
+
+```go
+module example.com/lib/v2
+```
+
+导入也要带 `/v2`：
+
+```go
+import "example.com/lib/v2/client"
+```
+
+这是为了让 v1 和 v2 可以在同一个构建里共存，因为它们是不同的导入路径。
+
+常见错误是升级到了 v2 版本，但 import 路径还停留在 v1。
+
+## Minimal Version Selection
+
+Go 使用 Minimal Version Selection。它会在依赖图中选择满足要求的版本，而不是每次自动取最新版本。
+
+如果你的模块要求：
+
+```go
+require example.com/lib v1.2.0
+```
+
+另一个依赖要求：
+
+```go
+require example.com/lib v1.5.0
+```
+
+最终会选择 `v1.5.0`。但不会因为有 `v1.9.0` 就自动升级到 `v1.9.0`。
+
+查看最终版本：
+
+```sh
+go list -m all
+```
+
+升级依赖：
+
+```sh
+go get example.com/lib@v1.9.0
+go mod tidy
+```
+
+## replace
+
+本地联调：
 
 ```go
 replace example.com/lib => ../lib
 ```
 
+临时 fork：
+
+```go
+replace example.com/lib => github.com/your/lib v1.2.3-fix
+```
+
+关键点：
+
+- `replace` 只在当前主模块生效。
+- 下游依赖你的库时，不会继承你的 replace。
+- 发布库前要检查临时 replace 是否应该移除。
+
+如果应用仓库需要 replace，可以接受；如果公共库提交了指向本地路径的 replace，通常会让使用者困惑。
+
+## vendor
+
+生成 vendor：
+
+```sh
+go mod vendor
+```
+
+使用 vendor 构建：
+
+```sh
+go build -mod=vendor ./...
+```
+
+vendor 适合：
+
+- 离线构建。
+- 固定供应链输入。
+- 公司内部审计依赖源码。
+
+代价是仓库变大，依赖升级 diff 变重。是否使用 vendor 要团队统一约定。
+
+## 常用排查命令
+
+看最终依赖版本：
+
+```sh
+go list -m all
+```
+
+看某依赖为什么被引入：
+
+```sh
+go mod why github.com/pkg/errors
+```
+
+看依赖图：
+
+```sh
+go mod graph
+```
+
+整理依赖：
+
+```sh
+go mod tidy
+```
+
+干净环境构建能验证 `replace`、私有代理、vendor 假设是否成立。
+
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“Go Module”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- `go.mod` 和 `go.sum` 分别负责什么？
+- `// indirect` 能不能手动删除？
+- v2 及以上版本为什么通常要改 module path？
+- Minimal Version Selection 和“每次取最新”有什么区别？
+- `replace` 的生效范围是什么？
+- vendor 适合什么场景，代价是什么？

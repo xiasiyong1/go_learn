@@ -1,60 +1,174 @@
 # 028. goroutine 和 channel 基础 - 面试追问
 
-## 追问与参考答案
+## 1. goroutine 启动后主函数会自动等待吗？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+不会。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+func main() {
+	go fmt.Println("hello")
+}
+```
 
-- Go 调度器把大量 goroutine 映射到较少 OS 线程上执行。
-- 无缓冲 channel 发送和接收同步完成；有缓冲 channel 在缓冲未满或非空时可异步推进。
-- channel send、receive、close 都和内存可见性有关。
-- channel 本身不解决所有并发问题，错误关闭、泄漏、缓冲过大都可能引入问题。
+`main` 返回后进程结束，goroutine 可能还没执行。
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+需要等待时，用 `sync.WaitGroup`：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+var wg sync.WaitGroup
+wg.Add(1)
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+go func() {
+	defer wg.Done()
+	fmt.Println("hello")
+}()
 
-- 数据所有权清晰、流水线式处理适合 channel。
-- 多个 goroutine 频繁读写同一内存结构，mutex 可能更简单高效。
-- 启动 goroutine 必须明确退出条件和结果处理路径。
-- 不要把 channel 当队列无限堆积，容量和消费速度要匹配。
+wg.Wait()
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+如果需要拿结果，用 channel：
 
-### 3. 这道题最容易追问哪些坑？
+```go
+resultCh := make(chan int, 1)
+go func() {
+	resultCh <- compute()
+}()
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+result := <-resultCh
+```
 
-- 只启动 goroutine 不等待，主函数退出后任务直接消失。
-- 发送方和接收方数量不匹配导致阻塞。
-- 把 channel 关闭权交给多个发送方，导致 panic。
-- 为了避免锁滥用 channel，反而让控制流更复杂。
+## 2. channel 通信为什么也能表达同步？
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+无缓冲 channel 的发送和接收必须同时准备好。
 
-### 4. 如何证明你的判断是对的？
+```go
+ch := make(chan struct{})
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+go func() {
+	doWork()
+	close(ch)
+}()
 
-- 用 race detector 检查共享变量是否被安全访问。
-- 用 pprof goroutine profile 查看是否有 channel 阻塞堆栈。
-- 为并发函数写取消、超时和错误返回测试。
+<-ch // 等待 doWork 完成
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+这里 channel 没传业务数据，只用于同步完成信号。
 
-### 5. 当规模变大后，这个问题会如何升级？
+传数据时也有同步含义：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+ch := make(chan int)
+go func() {
+	x := 1
+	ch <- x
+}()
 
-- 少量并发任务可以直接 goroutine 加 WaitGroup。
-- 任务量变大后，需要 worker pool、限流、背压和取消传播。
-- 服务级并发设计要关注资源上限，而不只是能否并发执行。
+fmt.Println(<-ch)
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+发送完成前的写入，对接收方是可见的。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+## 3. 什么时候应该用 channel，什么时候用 mutex 更清楚？
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+channel 适合数据流和所有权交接：
+
+```go
+jobs := make(chan Job)
+go producer(jobs)
+consumer(jobs)
+```
+
+mutex 适合保护共享状态：
+
+```go
+type Cache struct {
+	mu sync.RWMutex
+	m  map[string]User
+}
+```
+
+如果你发现自己用 channel 传各种命令，只是为了保护一个 map，可以考虑普通 map 加锁是否更直接。
+
+经验是：
+
+- 数据从 A 流到 B：channel。
+- 多个 goroutine 共同读写一个状态：mutex。
+- 单一 goroutine 拥有状态、其他 goroutine 发请求：channel owner 模型也可以。
+
+## 4. channel 方向类型有什么意义？
+
+它能把函数能力限制得更清楚。
+
+```go
+func produce(out chan<- int) {
+	out <- 1
+	close(out)
+}
+
+func consume(in <-chan int) {
+	for v := range in {
+		fmt.Println(v)
+	}
+}
+```
+
+`chan<- int` 只能发送，不能接收。`<-chan int` 只能接收，不能发送。
+
+这让 API 表达出职责：谁生产、谁消费、谁有资格关闭。
+
+## 5. goroutine 泄漏通常卡在哪些阻塞点？
+
+常见阻塞点：
+
+- 发送没人接收。
+- 接收没人发送，也没人关闭。
+- select 没有监听取消。
+- I/O 没有 timeout。
+- 等锁或 WaitGroup 永远等不到。
+
+发送阻塞例子：
+
+```go
+func leak() {
+	ch := make(chan int)
+	go func() {
+		ch <- 1
+	}()
+}
+```
+
+修正：
+
+```go
+func send(ctx context.Context, ch chan<- int) {
+	go func() {
+		select {
+		case ch <- 1:
+		case <-ctx.Done():
+			return
+		}
+	}()
+}
+```
+
+## 6. 并发任务的错误应该怎么返回给调用方？
+
+单个 goroutine 可以用带缓冲 error channel：
+
+```go
+errCh := make(chan error, 1)
+
+go func() {
+	errCh <- doWork()
+}()
+
+if err := <-errCh; err != nil {
+	return err
+}
+```
+
+带缓冲是为了避免调用方超时返回后，发送错误的 goroutine 卡住。
+
+多个 goroutine 可以收集多个错误，或使用 `errgroup` 这类工具处理“第一个错误取消其他任务”的模式。
+
+无论哪种方式，都不要只在 goroutine 里打印错误然后丢掉，调用方需要知道任务是否成功。

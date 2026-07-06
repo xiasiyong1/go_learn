@@ -6,45 +6,45 @@
 
 ## 先给结论
 
-Timer 表示一次性时间事件，Ticker 表示周期性事件。它们的难点在 Stop、Reset、资源释放和循环中创建 timer 的成本。
+`Timer` 是一次性定时事件，`Ticker` 是周期性定时事件。
 
-## 深入理解
+常见规则：
 
-### 1. 这道题真正考察什么
+- 单次简单超时可以用 `time.After`。
+- 循环或高频超时逻辑不要反复 `time.After`，优先复用 `Timer` 或使用 `Ticker`。
+- `Ticker` 用完要 `Stop()`。
+- `Timer.Reset` 前要清楚旧 timer 是否已经触发，避免读到旧事件。
+- 慢消费者不会收到每一个 tick，不能把 ticker 当精确任务队列。
 
-- 是否知道 Timer 只触发一次，Ticker 持续触发直到 Stop。
-- 是否理解 Stop 的返回值和 channel 中可能已有值的关系。
-- 是否知道 Reset 前要处理旧 timer 状态。
-- 是否能解释循环中 `time.After` 的资源和分配问题。
+## 单次超时：time.After
 
-### 2. 底层机制要讲清楚
+```go
+select {
+case result := <-resultCh:
+	return result, nil
+case <-time.After(time.Second):
+	return Result{}, fmt.Errorf("timeout")
+}
+```
 
-- Timer 到期后会尝试向自己的 channel 发送时间值。
-- Stop 返回 false 表示 timer 已到期或已停止，channel 里可能还有未读值。
-- Reset 复用 timer，但必须避免旧事件和新事件混在一起。
-- Ticker 如果不 Stop，会持续关联运行时计时器资源。
+这适合单次等待。代码简单，可读性好。
 
-### 3. 工程实践怎么取舍
+如果在循环里每次都调用 `time.After`：
 
-- 单次简单超时可用 `time.After`。
-- 循环或高频超时逻辑使用 `time.NewTimer` 并复用。
-- 周期任务用 Ticker，并在退出路径 `defer ticker.Stop()`。
-- 重置 timer 前按照官方推荐处理 Stop 和 drain，避免读到旧事件。
+```go
+for {
+	select {
+	case item := <-items:
+		handle(item)
+	case <-time.After(time.Second):
+		report()
+	}
+}
+```
 
-### 4. 常见误区
+每轮都会创建新的 timer，高频路径会有额外成本。
 
-- 循环里每次 select 都创建 `time.After`，造成大量 timer。
-- Ticker 不 Stop，后台资源持续存在。
-- Stop 返回 false 后没有 drain，下一轮读到旧超时。
-- 以为 Ticker 会补齐所有错过的 tick，实际慢消费者会丢或合并节奏。
-
-## 如何验证理解
-
-- 写单测覆盖 timer 被提前 Stop、到期后 Reset 的边界。
-- 用 benchmark 看 `time.After` 循环的分配。
-- 用 goroutine 和 heap profile 排查 timer/ticker 使用不当造成的资源增长。
-
-## 代码示例
+## 周期任务：Ticker
 
 ```go
 ticker := time.NewTicker(time.Second)
@@ -53,19 +53,97 @@ defer ticker.Stop()
 for {
 	select {
 	case <-ticker.C:
-		doWork()
+		report()
 	case <-ctx.Done():
-		return
+		return ctx.Err()
 	}
 }
 ```
+
+`Stop()` 很重要：它表达这个周期事件的生命周期结束了。长期服务里不要让后台 ticker 没有退出路径。
+
+## Ticker 不保证补齐所有 tick
+
+```go
+ticker := time.NewTicker(100 * time.Millisecond)
+defer ticker.Stop()
+
+for range ticker.C {
+	time.Sleep(time.Second)
+}
+```
+
+消费者处理很慢时，ticker 不会无限堆积 tick 让你补齐。它适合“按节奏触发”，不适合表达“每一个周期任务都必须执行一次”的可靠队列。
+
+如果每个周期任务都不能丢，要显式设计任务队列、持久化或补偿机制。
+
+## Timer 和 Stop
+
+```go
+timer := time.NewTimer(time.Second)
+defer timer.Stop()
+
+select {
+case <-timer.C:
+	return fmt.Errorf("timeout")
+case result := <-resultCh:
+	if !timer.Stop() {
+		<-timer.C
+	}
+	return result.Err
+}
+```
+
+这里有一个细节：`Stop` 返回 false 可能表示 timer 已经触发，channel 里可能还有值。为了避免后续复用 timer 时读到旧值，常见做法是 drain。
+
+不过实际写法要避免在 channel 已经被其他分支读走时盲目 drain，否则可能阻塞。复杂 timer 复用最好封装起来，别在业务代码里散落。
+
+## Timer Reset
+
+复用 timer 时，核心是避免旧事件和新事件混在一起。
+
+简单场景可以这样封装：
+
+```go
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+```
+
+使用：
+
+```go
+timer := time.NewTimer(time.Second)
+defer timer.Stop()
+
+for {
+	resetTimer(timer, time.Second)
+	select {
+	case <-timer.C:
+		return fmt.Errorf("idle timeout")
+	case msg := <-messages:
+		handle(msg)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
+
+Timer 的 Stop/Reset 细节比较容易写错。低频代码用简单方式；高频路径再考虑复用和封装。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“Timer 和 Ticker”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- `Timer` 和 `Ticker` 的语义区别是什么？
+- 为什么循环里反复 `time.After` 要谨慎？
+- `Ticker` 为什么要 `Stop()`？
+- `Ticker` 会不会补齐慢消费者错过的 tick？
+- `Timer.Stop()` 返回 false 说明什么？
+- `Timer.Reset()` 前为什么要处理旧状态？

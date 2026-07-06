@@ -6,60 +6,198 @@ goroutine 和 channel 的基本通信模型是什么？
 
 ## 先给结论
 
-goroutine 是 Go 调度器管理的轻量并发执行单元，channel 是类型安全的通信和同步原语。关键不是“channel 比锁高级”，而是选择合适的共享状态模型。
+goroutine 是 Go 里的并发执行单元，创建成本比 OS 线程低，由 Go runtime 调度到 OS 线程上运行。
 
-## 深入理解
+channel 是类型安全的通信和同步原语。它可以传数据，也可以表达同步、所有权转移和退出信号。
 
-### 1. 这道题真正考察什么
+但 channel 不是“比锁高级”的替代品。共享状态可以用锁保护，数据流水线和所有权交接更适合 channel。关键是选择更清楚的并发模型。
 
-- 是否知道 goroutine 不是系统线程，但最终运行在线程上。
-- 是否理解 channel 既能传数据，也能建立同步关系。
-- 是否能区分通过通信共享内存和通过锁保护共享内存。
-- 是否能设计 goroutine 的退出和错误传播。
+## 启动 goroutine
 
-### 2. 底层机制要讲清楚
+```go
+go func() {
+	fmt.Println("hello")
+}()
+```
 
-- Go 调度器把大量 goroutine 映射到较少 OS 线程上执行。
-- 无缓冲 channel 发送和接收同步完成；有缓冲 channel 在缓冲未满或非空时可异步推进。
-- channel send、receive、close 都和内存可见性有关。
-- channel 本身不解决所有并发问题，错误关闭、泄漏、缓冲过大都可能引入问题。
+启动 goroutine 后，调用方不会等待它完成。下面这段程序可能什么都来不及输出：
 
-### 3. 工程实践怎么取舍
+```go
+func main() {
+	go fmt.Println("hello")
+}
+```
 
-- 数据所有权清晰、流水线式处理适合 channel。
-- 多个 goroutine 频繁读写同一内存结构，mutex 可能更简单高效。
-- 启动 goroutine 必须明确退出条件和结果处理路径。
-- 不要把 channel 当队列无限堆积，容量和消费速度要匹配。
+如果要等待，使用 `sync.WaitGroup`：
 
-### 4. 常见误区
+```go
+var wg sync.WaitGroup
+wg.Add(1)
 
-- 只启动 goroutine 不等待，主函数退出后任务直接消失。
-- 发送方和接收方数量不匹配导致阻塞。
-- 把 channel 关闭权交给多个发送方，导致 panic。
-- 为了避免锁滥用 channel，反而让控制流更复杂。
+go func() {
+	defer wg.Done()
+	fmt.Println("hello")
+}()
 
-## 如何验证理解
+wg.Wait()
+```
 
-- 用 race detector 检查共享变量是否被安全访问。
-- 用 pprof goroutine profile 查看是否有 channel 阻塞堆栈。
-- 为并发函数写取消、超时和错误返回测试。
+面试里要强调：启动 goroutine 时，要同时设计退出、等待、错误处理。
 
-## 代码示例
+## channel 基本通信
 
 ```go
 ch := make(chan int)
+
 go func() {
 	ch <- 1
 }()
+
+v := <-ch
+fmt.Println(v)
+```
+
+无缓冲 channel 上，发送和接收要同时准备好，通信才完成。这既是传值，也是同步。
+
+有缓冲 channel：
+
+```go
+ch := make(chan int, 2)
+ch <- 1
+ch <- 2
+
+fmt.Println(<-ch)
 fmt.Println(<-ch)
 ```
+
+缓冲未满时发送可以先完成；缓冲为空时接收会阻塞。
+
+## channel 适合所有权交接
+
+```go
+func producer(out chan<- Job) {
+	defer close(out)
+	for i := 0; i < 10; i++ {
+		out <- Job{ID: i}
+	}
+}
+
+func consumer(in <-chan Job) {
+	for job := range in {
+		handle(job)
+	}
+}
+```
+
+这里 `producer` 生成 job，通过 channel 交给 `consumer`。所有权流向很清楚。
+
+方向类型能让 API 更明确：
+
+```go
+func producer(out chan<- Job) {}
+func consumer(in <-chan Job) {}
+```
+
+`chan<- Job` 只能发送，`<-chan Job` 只能接收。
+
+## 什么时候用锁更简单
+
+如果多个 goroutine 频繁读写同一个内存结构，锁通常更直接。
+
+```go
+type Counter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c *Counter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+}
+```
+
+不要为了“使用 channel”把简单状态保护写成复杂消息循环。
+
+channel 更适合：
+
+- pipeline。
+- worker pool。
+- fan-in / fan-out。
+- 任务队列。
+- 所有权交接。
+- 取消信号。
+
+mutex 更适合：
+
+- 保护共享 map。
+- 保护计数器或状态结构。
+- 多个操作需要维护同一个不变量。
+
+## goroutine 泄漏的基本例子
+
+```go
+func leak() {
+	ch := make(chan int)
+	go func() {
+		ch <- 1 // 没有人接收，永久阻塞
+	}()
+}
+```
+
+修正方向：让发送可以取消，或者保证接收。
+
+```go
+func send(ctx context.Context, ch chan<- int) {
+	go func() {
+		select {
+		case ch <- 1:
+		case <-ctx.Done():
+			return
+		}
+	}()
+}
+```
+
+只要创建 goroutine，就要知道它在什么条件下退出。
+
+## 错误传播不能丢
+
+不推荐：
+
+```go
+go func() {
+	if err := doWork(); err != nil {
+		log.Println(err)
+	}
+}()
+```
+
+调用方不知道任务是否失败。
+
+简单场景可以用 error channel：
+
+```go
+errCh := make(chan error, 1)
+
+go func() {
+	errCh <- doWork()
+}()
+
+if err := <-errCh; err != nil {
+	return err
+}
+```
+
+多个 goroutine 的错误收集可以用 `errgroup`，后面并发错误处理题会继续展开。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“goroutine 和 channel 基础”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- goroutine 启动后主函数会自动等待吗？
+- channel 通信为什么也能表达同步？
+- 什么时候应该用 channel，什么时候用 mutex 更清楚？
+- channel 方向类型有什么意义？
+- goroutine 泄漏通常卡在哪些阻塞点？
+- 并发任务的错误应该怎么返回给调用方？

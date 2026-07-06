@@ -1,60 +1,152 @@
 # 034. sync.Once - 面试追问
 
-## 追问与参考答案
+## 1. `sync.Once` 保证的是成功一次还是最多一次？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+保证最多执行一次。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+var once sync.Once
+var n int
 
-- Once 内部通过原子状态和锁保证只让一个 goroutine 执行函数。
-- 函数执行完成后，其他 goroutine 看到 Once 完成状态，也能看到初始化写入。
-- Once 的语义是“最多执行一次”，不是“成功执行一次”。
-- Once 不提供重置能力，测试或重试需要另行设计。
+for i := 0; i < 10; i++ {
+	once.Do(func() {
+		n++
+	})
+}
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+fmt.Println(n) // 1
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+它不关心你的初始化是否“业务上成功”，只关心函数是否已经执行过。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+## 2. `Do` 里的函数返回错误时，后续会不会重试？
 
-- 全局只需要初始化一次且失败不可恢复时，用 Once 简洁可靠。
-- 初始化可能失败且希望重试时，不要直接把失败逻辑塞进 Once。
-- 需要带参数初始化时，Once 要配合明确的配置来源，避免第一次调用参数决定全局状态。
-- 测试中避免全局 Once 污染多个用例，必要时封装成可创建实例。
+如果你把错误保存到外部变量里，后续不会重试。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+```go
+var once sync.Once
+var cfg Config
+var err error
 
-### 3. 这道题最容易追问哪些坑？
+func GetConfig() (Config, error) {
+	once.Do(func() {
+		cfg, err = LoadConfig()
+	})
+	return cfg, err
+}
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+第一次 `LoadConfig` 失败后，后续 `GetConfig` 还是返回同一个错误。
 
-- 初始化失败后返回错误，但 Once 阻止后续重试。
-- 第一次调用传入测试配置，后续生产路径复用错误状态。
-- 在 Once 函数里调用依赖自己初始化结果的代码，造成死锁或递归问题。
-- 为了测试强行依赖未公开字段重置 Once。
+如果需要失败后重试，用锁自己控制：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+```go
+type Loader struct {
+	mu  sync.Mutex
+	cfg *Config
+}
 
-### 4. 如何证明你的判断是对的？
+func (l *Loader) Get() (*Config, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+	if l.cfg != nil {
+		return l.cfg, nil
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		return nil, err
+	}
+	l.cfg = &cfg
+	return l.cfg, nil
+}
+```
 
-- 写并发测试确认初始化函数只执行一次。
-- 写失败测试确认失败后是否符合预期重试策略。
-- 用 race detector 验证初始化结果读取无数据竞争。
+## 3. `Do` 里的函数 panic 后，后续会不会重试？
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+不会。
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+var once sync.Once
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+func Init() {
+	once.Do(func() {
+		panic("boom")
+	})
+}
+```
 
-- 简单单例场景 Once 很合适。
-- 复杂资源管理中，Once 可能掩盖生命周期问题，应考虑显式初始化和关闭。
-- 配置热更新或多租户场景通常不适合全局 Once。
+第一次调用 panic 后，`once` 仍然认为函数已经执行过。后续调用不会再执行初始化函数。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+所以如果初始化可能 panic 且你希望恢复后重试，不要直接用 `sync.Once` 表达这个逻辑。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+## 4. 带参数的初始化为什么容易被第一次调用污染？
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+因为 `Once` 只执行第一次调用传入的函数。
+
+```go
+func GetClient(dsn string) *Client {
+	once.Do(func() {
+		client = NewClient(dsn)
+	})
+	return client
+}
+```
+
+第一次调用传 `"test"`，后续传 `"prod"` 也不会生效。
+
+更好的做法是把参数放到构造阶段：
+
+```go
+type Provider struct {
+	once sync.Once
+	dsn  string
+	c    *Client
+}
+
+func NewProvider(dsn string) *Provider {
+	return &Provider{dsn: dsn}
+}
+```
+
+这样第一次调用不会偷偷决定全局配置。
+
+## 5. 测试中全局 Once 有什么问题？
+
+全局 `Once` 一旦执行，后续测试很难重置状态。
+
+```go
+var once sync.Once
+var cfg Config
+```
+
+测试 A 加载了一个配置，测试 B 想换配置时，`once.Do` 不会再执行。
+
+更好的设计是用实例：
+
+```go
+func TestConfig(t *testing.T) {
+	loader := NewLoader("testdata/config.yaml")
+	cfg, err := loader.Config()
+	_ = cfg
+	_ = err
+}
+```
+
+每个测试有自己的 loader 和 once。
+
+## 6. 什么时候不用 Once，改用显式初始化更好？
+
+当初始化需要参数、可能失败并重试、需要关闭资源、需要热更新或多租户隔离时，显式初始化更好。
+
+```go
+func NewServer(cfg Config) (*Server, error) {
+	db, err := OpenDB(cfg.DSN)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{db: db}, nil
+}
+```
+
+`Once` 适合生命周期简单、全局唯一、初始化结果稳定的对象。复杂资源管理不要为了懒加载把生命周期藏起来。

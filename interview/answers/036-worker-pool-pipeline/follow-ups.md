@@ -1,60 +1,152 @@
 # 036. worker pool 和 pipeline - 面试追问
 
-## 追问与参考答案
+## 1. worker pool 解决什么问题？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+解决并发上限问题。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+不限制并发：
 
-- worker pool 通常由任务队列、固定数量 worker、结果或错误通道组成。
-- pipeline 每个阶段接收上游数据、处理后发送到下游。
-- 有缓冲 channel 可以吸收突发，但也可能隐藏慢消费者。
-- 取消信号必须传到所有可能阻塞的发送和接收点。
+```go
+for _, job := range jobs {
+	go process(job)
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+任务很多时，可能打爆数据库、RPC、内存或调度器。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+worker pool：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+jobsCh := make(chan Job)
+for i := 0; i < workerN; i++ {
+	go func() {
+		for job := range jobsCh {
+			process(job)
+		}
+	}()
+}
+```
 
-- CPU 密集型 worker 数通常接近 GOMAXPROCS，I/O 密集型根据外部延迟和限额调整。
-- 所有 channel 关闭应由发送方或协调者负责，避免多方 close。
-- 错误发生后关闭 cancel，不再发送新任务，并等待已启动任务收尾。
-- 对外部依赖设置并发上限，防止把压力转嫁给下游。
+同时处理的任务最多是 `workerN`。
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. worker 数量应该怎么定？
 
-### 3. 这道题最容易追问哪些坑？
+CPU 密集型接近 CPU 并行度：
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+workerN := runtime.GOMAXPROCS(0)
+```
 
-- 只关闭结果 channel，不取消仍在发送的上游 goroutine。
-- 任务 channel 无缓冲或过大缓冲都没有结合业务评估。
-- 某个阶段提前返回，导致上游阻塞发送泄漏。
-- worker 数量写死，迁移环境后吞吐或下游压力异常。
+I/O 密集型要看外部系统：
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+- 数据库连接池大小。
+- 下游 API 限流。
+- 单任务延迟。
+- 允许的排队时间。
 
-### 4. 如何证明你的判断是对的？
+不要把 workerN 当纯性能参数。它也是保护下游的资源上限。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+## 3. pipeline 每个阶段应该由谁关闭 channel？
 
-- 用压测观察不同 worker 数下的吞吐、延迟和错误率。
-- 用 goroutine profile 检查失败或取消后是否还有阻塞协程。
-- 写测试覆盖下游提前退出、上游报错、context 超时。
+每个阶段关闭自己的输出 channel。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+func stage(ctx context.Context, in <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for v := range in {
+			select {
+			case out <- transform(v):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+下游不应该关闭上游的输出 channel，因为上游可能还在发送。
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+## 4. 下游提前退出时为什么会上游泄漏？
 
-- 小批量任务可以简单 goroutine 加 WaitGroup。
-- 流量上来后，worker pool 是并发上限，pipeline 是系统背压边界。
-- 分布式系统里还要把本地 worker 数和队列、数据库、RPC 限额联动。
+因为上游可能阻塞在发送。
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+func gen() <-chan int {
+	out := make(chan int)
+	go func() {
+		for i := 0; ; i++ {
+			out <- i
+		}
+	}()
+	return out
+}
 
-### 6. 初学者应该怎么把这个问题学扎实？
+func first() int {
+	return <-gen()
+}
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+`first` 只读一个值就返回，`gen` 还会继续发送下一个值，然后阻塞。
+
+修正：传 context 并取消。
+
+```go
+ctx, cancel := context.WithCancel(parent)
+defer cancel()
+
+out := gen(ctx)
+v := <-out
+cancel()
+return v
+```
+
+## 5. worker pool 如何处理错误和取消？
+
+简单方式：结果里带 error。
+
+```go
+type Result struct {
+	Value Value
+	Err   error
+}
+```
+
+如果第一个错误应该取消其他任务，用 `errgroup.WithContext`：
+
+```go
+g, ctx := errgroup.WithContext(parent)
+
+for _, job := range jobs {
+	job := job
+	g.Go(func() error {
+		return process(ctx, job)
+	})
+}
+
+if err := g.Wait(); err != nil {
+	return err
+}
+```
+
+关键是任务内部也要监听 ctx，否则取消不会生效。
+
+## 6. 有缓冲 channel 在 worker pool 里解决什么，又掩盖什么？
+
+它能吸收短时间突发，让生产者和 worker 解耦一点。
+
+```go
+jobs := make(chan Job, 100)
+```
+
+但它不能提升长期处理能力。如果 worker 太慢，缓冲迟早会满。
+
+缓冲过大还会掩盖问题：
+
+- 排队时间变长。
+- 内存占用上升。
+- 上游更晚感知下游变慢。
+
+所以容量应该来自业务允许排队的数量和时间，而不是越大越好。

@@ -1,61 +1,136 @@
 # 038. 测试 - 面试追问
 
-## 追问与参考答案
+## 1. 表格驱动测试解决什么问题？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+解决重复测试逻辑和边界覆盖问题。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+func TestParseAge(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    int
+		wantErr bool
+	}{
+		{name: "valid", input: "18", want: 18},
+		{name: "empty", input: "", wantErr: true},
+		{name: "invalid", input: "abc", wantErr: true},
+	}
 
-- 表格驱动测试把输入、期望和名称放在数据表里，减少重复逻辑。
-- 子测试让每个 case 有独立名称，便于筛选和并行。
-- mock 的本质是替换外部依赖，让测试聚焦当前单元行为。
-- benchmark 默认关注性能，需要配合 `-benchmem` 看分配。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseAge(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("got %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+新增 case 只需要加一行数据，不需要复制整段测试。
 
-### 2. 这个知识点在真实项目里怎么取舍？
+## 2. 子测试有什么好处？
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+每个 case 有独立名字，失败时更容易定位，也能单独运行。
 
-- 优先测试可观察行为，不测试内部实现细节。
-- 外部依赖用接口、httptest、临时目录或测试容器隔离。
-- 对错误路径、边界值、并发取消和序列化兼容性补充测试。
-- mock 不要过度指定调用细节，否则重构会让测试脆弱。
+```sh
+go test -run 'TestParseAge/invalid'
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+子测试还能分组：
 
-### 3. 这道题最容易追问哪些坑？
+```go
+t.Run("invalid input", func(t *testing.T) {
+	// cases
+})
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+复杂行为可以按场景组织，而不是一个巨大测试函数从头跑到尾。
 
-- 只测试 happy path，错误路径无人覆盖。
-- 测试共享全局状态，导致用例顺序相关。
-- 并行子测试捕获循环变量出错。
-- benchmark 没有阻止编译器优化，结果不可信。
+## 3. 并行子测试为什么要注意循环变量？
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+并行子测试会延后执行，必须确保每个子测试拿到自己的 case。
 
-### 4. 如何证明你的判断是对的？
+```go
+for _, tt := range tests {
+	tt := tt
+	t.Run(tt.name, func(t *testing.T) {
+		t.Parallel()
+		got := Add(tt.a, tt.b)
+		if got != tt.want {
+			t.Fatalf("got %d, want %d", got, tt.want)
+		}
+	})
+}
+```
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+显式 `tt := tt` 能让意图清楚，也避免旧代码或外部变量复用带来的问题。
 
-- 用 `go test ./...` 跑完整测试。
-- 用 `go test -run TestName/subcase` 定位子测试。
-- 用 `go test -race` 跑并发相关测试。
-- 用 `go test -bench . -benchmem` 验证性能变化。
+## 4. `t.Helper()` 有什么作用？
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+它告诉测试框架：这个函数是 helper。失败时行号应该指向调用 helper 的地方。
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+没有 `t.Helper()` 时，失败位置可能总是 helper 内部那一行，定位不方便。
 
-- 小项目也要覆盖核心业务和错误路径。
-- 代码规模增大后，测试分层和测试数据管理比 mock 技巧更重要。
-- 性能优化必须有 benchmark 兜底，否则容易凭感觉改坏。
+## 5. mock、fake、httptest 分别适合什么场景？
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+fake 适合简单替换接口：
 
-### 6. 初学者应该怎么把这个问题学扎实？
+```go
+type fakeStore struct {
+	user User
+	err  error
+}
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+func (f fakeStore) Find(context.Context, int64) (User, error) {
+	return f.user, f.err
+}
+```
+
+mock 适合需要验证交互契约，比如必须调用某个外部接口一次。但不要过度 mock 内部实现细节。
+
+`httptest` 适合测试 HTTP 客户端或 handler：
+
+```go
+srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}))
+defer srv.Close()
+```
+
+优先选择最贴近真实边界、又能保持测试稳定的方式。
+
+## 6. benchmark 为什么要配合 `-benchmem`，如何避免结果被优化？
+
+`-benchmem` 能看到分配次数和分配字节数：
+
+```sh
+go test -bench . -benchmem
+```
+
+避免编译器优化：
+
+```go
+var sink string
+
+func BenchmarkBuild(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		sink = Build("a", "b")
+	}
+}
+```
+
+如果 benchmark 涉及准备数据，循环外准备；如果每轮都要重置状态，用 `b.ResetTimer()` 排除准备成本。

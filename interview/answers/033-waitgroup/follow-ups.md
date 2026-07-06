@@ -1,60 +1,186 @@
 # 033. WaitGroup - 面试追问
 
-## 追问与参考答案
+## 1. `Add` 为什么应该在启动 goroutine 前调用？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+因为 `Wait()` 可能在 goroutine 运行 `Add` 前就看到计数为 0 并返回。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+错误示例：
 
-- WaitGroup 内部维护计数和等待者数量。
-- `Done()` 等价于 `Add(-1)`。
-- 如果 goroutine 已经开始甚至结束后才 Add，Wait 可能提前返回。
-- WaitGroup 不传递 goroutine 的返回值，因此错误需要 channel、mutex 聚合或 errgroup。
+```go
+var wg sync.WaitGroup
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+go func() {
+	wg.Add(1)
+	defer wg.Done()
+	doWork()
+}()
 
-### 2. 这个知识点在真实项目里怎么取舍？
+wg.Wait()
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+正确写法：
 
-- 启动 goroutine 前调用 `wg.Add(1)`，goroutine 内 `defer wg.Done()`。
-- 需要错误和取消时优先考虑 `errgroup.WithContext`。
-- 需要限制并发时配合 semaphore、worker pool 或 errgroup 的限制能力。
-- 不要把 WaitGroup 复制传递，通常传指针或作为结构体字段谨慎使用。
+```go
+var wg sync.WaitGroup
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+wg.Add(1)
+go func() {
+	defer wg.Done()
+	doWork()
+}()
 
-### 3. 这道题最容易追问哪些坑？
+wg.Wait()
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+原则是：任务数量由启动方确定，启动方先 Add。
 
-- 在 goroutine 内部 Add，导致 Wait 和 Add 竞态。
-- 某个分支忘记 Done，Wait 永久阻塞。
-- Done 调多了，计数为负 panic。
-- 用 WaitGroup 等待任务，却没有处理任务失败后的取消。
+## 2. `Done` 和 `Add(-1)` 是什么关系？
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+`Done()` 等价于 `Add(-1)`。
 
-### 4. 如何证明你的判断是对的？
+```go
+wg.Add(1)
+wg.Done()
+```
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+等价于：
 
-- 为并发函数写测试，确保所有分支都会 Done。
-- 使用 race detector 检查 Add/Wait 是否存在竞态。
-- 故意制造错误任务，验证错误聚合和取消逻辑。
+```go
+wg.Add(1)
+wg.Add(-1)
+```
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+如果计数变成负数，会 panic：
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+var wg sync.WaitGroup
+wg.Done() // panic
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+所以 Add 和 Done 必须配对。goroutine 内部通常写 `defer wg.Done()`。
 
-- 少量任务等待用 WaitGroup 很合适。
-- 服务中批量并发调用通常还需要限流、错误传播、超时和取消。
-- 规模越大，越不应该裸用 WaitGroup 表达完整任务生命周期。
+## 3. WaitGroup 能不能收集 goroutine 的错误？
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+不能。它只等待，不传值。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+错误会被吞：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+go func() {
+	defer wg.Done()
+	_ = doWork()
+}()
+```
+
+简单方式用 error channel：
+
+```go
+errCh := make(chan error, len(jobs))
+
+for _, job := range jobs {
+	wg.Add(1)
+	go func(job Job) {
+		defer wg.Done()
+		errCh <- doWork(job)
+	}(job)
+}
+
+wg.Wait()
+close(errCh)
+
+for err := range errCh {
+	if err != nil {
+		return err
+	}
+}
+```
+
+如果还要“第一个错误取消其他任务”，用 `errgroup.WithContext` 更合适。
+
+## 4. WaitGroup 能不能限制并发数？
+
+不能。它只等待已经启动的任务。
+
+下面会启动 `len(jobs)` 个 goroutine：
+
+```go
+for _, job := range jobs {
+	wg.Add(1)
+	go func(job Job) {
+		defer wg.Done()
+		process(job)
+	}(job)
+}
+```
+
+限制并发可以加信号量：
+
+```go
+sem := make(chan struct{}, 10)
+
+for _, job := range jobs {
+	wg.Add(1)
+	go func(job Job) {
+		defer wg.Done()
+
+		sem <- struct{}{}
+		defer func() { <-sem }()
+
+		process(job)
+	}(job)
+}
+```
+
+或者使用固定数量 worker。
+
+## 5. WaitGroup 可以复用吗？
+
+可以，但必须等上一轮 `Wait()` 返回后，再开始下一轮 Add。
+
+```go
+var wg sync.WaitGroup
+
+runBatch := func(jobs []Job) {
+	for _, job := range jobs {
+		wg.Add(1)
+		go func(job Job) {
+			defer wg.Done()
+			process(job)
+		}(job)
+	}
+	wg.Wait()
+}
+
+runBatch(batch1)
+runBatch(batch2)
+```
+
+不要在一轮 Wait 尚未完成时混入下一轮 Add，这会让任务边界混乱。
+
+## 6. 为什么不能复制使用中的 WaitGroup？
+
+WaitGroup 内部有状态。复制后，Add/Done/Wait 操作可能落在不同副本上。
+
+错误示例：
+
+```go
+func Done(wg sync.WaitGroup) {
+	wg.Done()
+}
+```
+
+正确：
+
+```go
+func Done(wg *sync.WaitGroup) {
+	wg.Done()
+}
+```
+
+更好的设计是不要把 WaitGroup 到处传，让创建 goroutine 的函数自己负责 Add、Done 和 Wait。
+
+可以用工具辅助发现复制锁类问题：
+
+```sh
+go vet -copylocks ./...
+```

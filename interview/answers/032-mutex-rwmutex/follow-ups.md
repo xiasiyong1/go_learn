@@ -1,60 +1,185 @@
 # 032. Mutex 和 RWMutex - 面试追问
 
-## 追问与参考答案
+## 1. Mutex 保护的到底是什么？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+保护的是共享状态和不变量。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+```go
+type Account struct {
+	mu      sync.Mutex
+	balance int64
+}
 
-- Mutex 同一时刻只允许一个 goroutine 进入临界区。
-- RWMutex 允许多个读者并发，但写者需要独占。
-- 读锁期间不能安全升级为写锁，否则容易死锁。
-- 锁的成本来自竞争、阻塞唤醒、缓存同步和临界区持有时间。
+func (a *Account) Withdraw(n int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+	if a.balance < n {
+		return false
+	}
+	a.balance -= n
+	return true
+}
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+这里锁保护的不只是 `balance -= n`，还保护“检查余额”和“扣减余额”必须作为一个整体完成。
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+如果把检查和扣减拆开加锁，中间可能被其他 goroutine 修改，业务不变量就破坏了。
 
-- 优先让临界区小而明确，只保护必要共享状态。
-- 读操作非常频繁且临界区足够长时，再考虑 RWMutex。
-- 持锁期间避免执行慢 I/O、调用外部回调或进行可能阻塞的操作。
-- 使用 `defer Unlock` 提升安全性，但热点极短临界区可以评估显式 Unlock。
+## 2. RWMutex 一定比 Mutex 快吗？
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+不一定。
 
-### 3. 这道题最容易追问哪些坑？
+`RWMutex` 允许多个读者并发，但它有额外成本。临界区很短、写入频繁、竞争不明显时，`Mutex` 可能更快也更清楚。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+应该用 benchmark 验证：
 
-- 锁住 map 后返回内部引用，让调用方在锁外修改。
-- 在持锁状态下调用未知函数，导致锁顺序不可控。
-- 复制已经使用的 Mutex 或包含 Mutex 的结构体。
-- 认为 RWMutex 在读多写少时一定更优，忽略写者等待和读锁开销。
+```go
+func BenchmarkGet(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		cache.Get("key")
+	}
+}
+```
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+选择原则：
 
-### 4. 如何证明你的判断是对的？
+- 正确性第一。
+- 读多且读临界区有明显耗时时考虑 `RWMutex`。
+- 没有数据前不要为了“看起来更并发”换锁。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+## 3. 为什么读操作也需要加锁？
 
-- 用 `go test -race` 验证共享状态访问。
-- 用 mutex profile 或 block profile 定位锁竞争。
-- 用 benchmark 在目标读写比例下比较 Mutex 和 RWMutex。
+因为读写并发也是数据竞争。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+错误示例：
 
-### 5. 当规模变大后，这个问题会如何升级？
+```go
+type Cache struct {
+	mu sync.Mutex
+	m  map[string]string
+}
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+func (c *Cache) Get(key string) string {
+	return c.m[key] // 没加锁
+}
 
-- 低竞争场景简单 Mutex 通常足够。
-- 高并发读热点可考虑 RWMutex、分片、copy-on-write 或无锁读快照。
-- 当锁保护的数据跨模块暴露时，维护一致性比锁类型选择更重要。
+func (c *Cache) Set(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key] = value
+}
+```
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+写操作可能修改 map 内部结构，读操作不加锁仍然不安全。
 
-### 6. 初学者应该怎么把这个问题学扎实？
+正确写法：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+func (c *Cache) Get(key string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[key]
+}
+```
+
+或者使用 `RWMutex` 的 `RLock`。
+
+## 4. 为什么不能在锁外返回内部 map 或 slice？
+
+因为调用方会绕过锁修改内部状态。
+
+```go
+func (c *Cache) Raw() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.m
+}
+```
+
+调用方：
+
+```go
+cache.Raw()["x"] = "y"
+```
+
+这次写入没有经过锁。
+
+正确做法是返回快照：
+
+```go
+func (c *Cache) Snapshot() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	cp := make(map[string]string, len(c.m))
+	for k, v := range c.m {
+		cp[k] = v
+	}
+	return cp
+}
+```
+
+如果 map 的 value 是指针或 slice，还要继续考虑是否需要深拷贝。
+
+## 5. 为什么持锁调用回调容易出问题？
+
+因为你无法控制回调做什么。它可能很慢，可能再次请求同一把锁。
+
+```go
+func (c *Cache) Range(fn func(string, string)) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for k, v := range c.m {
+		fn(k, v)
+	}
+}
+```
+
+如果 `fn` 里调用 `c.Set`，就可能阻塞等待写锁。
+
+更好的做法：
+
+```go
+func (c *Cache) Range(fn func(string, string)) {
+	items := c.Snapshot()
+	for k, v := range items {
+		fn(k, v)
+	}
+}
+```
+
+锁内复制数据，锁外执行未知逻辑。
+
+## 6. 读锁能不能升级成写锁？
+
+不能安全地直接升级。
+
+错误示例：
+
+```go
+c.mu.RLock()
+if _, ok := c.m[key]; !ok {
+	c.mu.Lock() // 可能死锁
+}
+```
+
+应该释放读锁，再获取写锁，并重新检查状态：
+
+```go
+c.mu.RLock()
+_, ok := c.m[key]
+c.mu.RUnlock()
+
+if !ok {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.m[key]; !ok {
+		c.m[key] = value
+	}
+}
+```
+
+重新检查是必要的，因为释放读锁到获得写锁之间，其他 goroutine 可能已经写入。

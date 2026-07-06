@@ -1,60 +1,176 @@
 # 035. atomic 和 Mutex - 面试追问
 
-## 追问与参考答案
+## 1. atomic 适合哪些简单场景？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+适合单变量、独立状态。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+计数器：
 
-- atomic 操作对单个变量提供不可分割的读改写。
-- 多个原子变量之间没有天然事务关系，读取组合状态可能不一致。
-- Mutex 让临界区内多个字段的更新和读取保持一致。
-- Go 的 atomic 类型和函数提供同步语义，读写双方都要使用 atomic 才成立。
+```go
+var requests atomic.Int64
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+requests.Add(1)
+fmt.Println(requests.Load())
+```
 
-### 2. 这个知识点在真实项目里怎么取舍？
+开关：
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+```go
+var closed atomic.Bool
 
-- 计数器、开关、状态位、只读配置指针替换适合 atomic。
-- 多个字段必须一起变化时，用 Mutex。
-- 优先选择可读、可证明正确的锁方案，再根据 profiling 考虑 atomic 优化。
-- 使用 `atomic.Int64` 等类型比散落函数调用更清晰。
+closed.Store(true)
+if closed.Load() {
+	return ErrClosed
+}
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+配置快照指针：
 
-### 3. 这道题最容易追问哪些坑？
+```go
+var cfg atomic.Value // stores *Config
+cfg.Store(&Config{Timeout: time.Second})
+```
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+如果状态之间有业务关系，就不要急着用 atomic。
 
-- 用多个 atomic 变量维护复杂状态，读到中间态。
-- atomic 写，普通读，仍然是数据竞争。
-- 为了性能放弃锁，结果引入 ABA、重排理解错误或忙等。
-- 把 atomic 当成“无锁就一定快”。
+## 2. 为什么 atomic 写、普通读仍然有数据竞争？
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+因为同步必须覆盖所有访问路径。
 
-### 4. 如何证明你的判断是对的？
+错误示例：
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+```go
+var n int64
 
-- 用 `go test -race` 验证所有访问路径都同步。
-- 写并发压力测试检查组合状态是否违反不变量。
-- 用 benchmark 比较锁和 atomic 在真实竞争程度下的表现。
+func Inc() {
+	atomic.AddInt64(&n, 1)
+}
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+func Get() int64 {
+	return n
+}
+```
 
-### 5. 当规模变大后，这个问题会如何升级？
+`Get` 是普通读，没有使用 atomic。正确写法：
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+```go
+func Get() int64 {
+	return atomic.LoadInt64(&n)
+}
+```
 
-- 低竞争场景锁成本通常可以忽略。
-- 高频计数指标用 atomic 很常见。
-- 复杂并发算法使用 atomic 前，要能清楚证明线性化点和内存可见性。
+使用 `atomic.Int64` 更不容易写错：
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+var n atomic.Int64
 
-### 6. 初学者应该怎么把这个问题学扎实？
+func Inc() { n.Add(1) }
+func Get() int64 { return n.Load() }
+```
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+## 3. 多个 atomic 变量能不能维护复杂不变量？
+
+通常不适合。
+
+```go
+type State struct {
+	ready atomic.Bool
+	count atomic.Int64
+}
+```
+
+你可能读到 `ready=true` 但 `count` 还没更新，或者反过来。多个 atomic 变量之间没有自动事务。
+
+需要一致快照时，用锁：
+
+```go
+type State struct {
+	mu    sync.Mutex
+	ready bool
+	count int64
+}
+
+func (s *State) Snapshot() (bool, int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ready, s.count
+}
+```
+
+或者把不可变快照整体替换：
+
+```go
+type Snapshot struct {
+	Ready bool
+	Count int64
+}
+
+var snap atomic.Value // stores Snapshot
+```
+
+## 4. `atomic.Value` 适合什么场景？
+
+适合读多写少的整体替换。
+
+```go
+type Config struct {
+	Limit int
+}
+
+var current atomic.Value // stores Config
+
+func GetConfig() Config {
+	return current.Load().(Config)
+}
+
+func SetConfig(c Config) {
+	current.Store(c)
+}
+```
+
+注意不要 Store 一个会被继续修改的 map：
+
+```go
+type Config struct {
+	Headers map[string]string
+}
+```
+
+如果要存这种配置，先深拷贝，让读者看到不可变快照。
+
+## 5. 为什么 Mutex 往往更容易写对？
+
+因为它能把多个操作放进同一个临界区。
+
+```go
+func (a *Account) Transfer(to *Account, n int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.balance < n {
+		return false
+	}
+	a.balance -= n
+	to.balance += n
+	return true
+}
+```
+
+这里的检查和更新必须一起完成。用 atomic 拆成多个变量，很难证明没有中间态。
+
+锁的代码通常更容易 review：锁住、检查、修改、解锁。
+
+## 6. atomic 一定比 Mutex 快吗？
+
+不一定。
+
+低竞争场景下，Mutex 成本可能很低；atomic 如果写成忙等或复杂 CAS 循环，可能更慢也更难维护。
+
+判断方式是 benchmark 和 profile：
+
+```sh
+go test -bench . -benchmem
+go test -run '^$' -bench . -mutexprofile mutex.out
+```
+
+面试回答要稳：先选能证明正确的方案，再用数据决定是否优化。

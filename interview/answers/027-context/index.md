@@ -6,59 +6,231 @@
 
 ## 先给结论
 
-context 用于在调用链上传递取消、超时、截止时间和请求范围值。它不是可选参数容器，也不会自动终止 goroutine，必须由代码主动监听。
+`context.Context` 用来在调用链上传递取消信号、超时、截止时间和请求范围值。
 
-## 深入理解
+它不负责强制杀死 goroutine，也不是可选参数容器。代码必须主动监听 `ctx.Done()`，阻塞调用也必须接收 context，取消才真正生效。
 
-### 1. 这道题真正考察什么
+常见规则：
 
-- 是否知道 context 应作为函数第一个参数传递。
-- 是否能区分 `WithCancel`、`WithTimeout`、`WithDeadline`。
-- 是否知道 cancel 必须调用以释放 timer 和子 context 资源。
-- 是否能说明 context value 的使用边界。
+- `ctx` 通常作为函数第一个参数。
+- 不要把 `context.Context` 存进结构体长期持有。
+- 派生出带 cancel/timeout 的 context 后，要调用 `cancel()`。
+- `context.Value` 只放请求范围元数据，不放业务必填参数。
 
-### 2. 底层机制要讲清楚
-
-- context 构成树状结构，父 context 取消会传播给子 context。
-- `Done()` 返回 channel，关闭表示取消或超时发生。
-- `Err()` 可以区分 `Canceled` 和 `DeadlineExceeded`。
-- context value 适合请求范围的元数据，不适合传业务参数或可选配置。
-
-### 3. 工程实践怎么取舍
-
-- 入口层创建带超时或取消的 context，向下游传递。
-- 启动 goroutine 时把 context 传进去，并在 select 中监听 `ctx.Done()`。
-- 使用 `defer cancel()` 释放资源，即使函数正常返回也要调用。
-- 日志 trace id、用户认证信息等可以放 value，但要用自定义 key 类型。
-
-### 4. 常见误区
-
-- 把 context 存进结构体长期持有。
-- 忘记 cancel，导致 timer 和子 context 资源延迟释放。
-- 把业务必填参数塞进 context value，破坏函数签名清晰度。
-- 认为 context 取消后正在执行的代码会被强制中断。
-
-## 如何验证理解
-
-- 写测试构造超时 context，确认函数及时返回。
-- 用 goroutine 泄漏测试检查取消后后台任务是否退出。
-- 在日志中输出 `ctx.Err()`，区分主动取消和超时。
-
-## 代码示例
+## 基本用法
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+func FetchUser(ctx context.Context, id int64) (*User, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL(id), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return decodeUser(resp.Body)
+}
+```
+
+调用方设置超时：
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 defer cancel()
 
-err := callRemote(ctx)
+u, err := FetchUser(ctx, 1001)
 ```
+
+`defer cancel()` 即使在正常返回时也要调用，因为它会释放 timer 和子 context 相关资源。
+
+## `WithCancel`、`WithTimeout`、`WithDeadline`
+
+手动取消：
+
+```go
+ctx, cancel := context.WithCancel(parent)
+defer cancel()
+
+go func() {
+	if needStop() {
+		cancel()
+	}
+}()
+```
+
+相对超时：
+
+```go
+ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+defer cancel()
+```
+
+绝对截止时间：
+
+```go
+deadline := time.Now().Add(3 * time.Second)
+ctx, cancel := context.WithDeadline(parent, deadline)
+defer cancel()
+```
+
+`WithTimeout` 本质上是设置“从现在开始多久后取消”；`WithDeadline` 是“到某个具体时间点取消”。
+
+## context 是取消信号，不是强制中断
+
+错误示例：
+
+```go
+func Worker(ctx context.Context) {
+	for {
+		doWork() // 永远不检查 ctx
+	}
+}
+```
+
+即使外部调用 `cancel()`，这个 goroutine 也不会自动退出。
+
+正确方向：
+
+```go
+func Worker(ctx context.Context, jobs <-chan Job) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			handle(job)
+		}
+	}
+}
+```
+
+如果 `handle` 里也可能阻塞，要继续传入 context：
+
+```go
+func Worker(ctx context.Context, jobs <-chan Job) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-jobs:
+			_ = handle(ctx, job)
+		}
+	}
+}
+```
+
+取消信号必须传到真正可能阻塞的位置。
+
+## 用 `Err()` 区分取消原因
+
+```go
+select {
+case <-ctx.Done():
+	return ctx.Err()
+case result := <-done:
+	return result.Err
+}
+```
+
+常见结果：
+
+```go
+context.Canceled
+context.DeadlineExceeded
+```
+
+主动取消和超时在日志、指标、重试策略上可能不同：
+
+```go
+if errors.Is(err, context.DeadlineExceeded) {
+	metrics.Timeouts.Add(1)
+}
+if errors.Is(err, context.Canceled) {
+	metrics.Canceled.Add(1)
+}
+```
+
+## 不要把 context 存进结构体
+
+不推荐：
+
+```go
+type Service struct {
+	ctx context.Context
+}
+
+func (s *Service) GetUser(id int64) (*User, error) {
+	return s.repo.Get(s.ctx, id)
+}
+```
+
+问题是：不同请求应该有不同的取消、超时、trace 信息。把 ctx 存进结构体会模糊生命周期。
+
+推荐：
+
+```go
+type Service struct {
+	repo *Repository
+}
+
+func (s *Service) GetUser(ctx context.Context, id int64) (*User, error) {
+	return s.repo.Get(ctx, id)
+}
+```
+
+少数长期后台组件可以持有用于整体生命周期的 context，但那应该是明确的设计，不是普通请求 ctx 的写法。
+
+## context value 的边界
+
+适合放请求范围元数据：
+
+```go
+type traceIDKey struct{}
+
+func WithTraceID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, traceIDKey{}, id)
+}
+
+func TraceID(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(traceIDKey{}).(string)
+	return id, ok
+}
+```
+
+不适合放业务必填参数：
+
+```go
+func CreateOrder(ctx context.Context) error {
+	userID := ctx.Value("user_id").(int64) // 不推荐
+	_ = userID
+	return nil
+}
+```
+
+更好的签名：
+
+```go
+func CreateOrder(ctx context.Context, userID int64, req CreateOrderRequest) error {
+	return nil
+}
+```
+
+业务参数应该显式出现在函数签名里，调用方和测试才清楚。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“context”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- context 取消后 goroutine 会自动退出吗？
+- 为什么创建 `WithTimeout` 后仍然要调用 `cancel()`？
+- `context.Canceled` 和 `context.DeadlineExceeded` 有什么区别？
+- 为什么不建议把 context 存进结构体？
+- `context.Value` 适合放什么，不适合放什么？
+- 如何写一个支持取消的 worker？

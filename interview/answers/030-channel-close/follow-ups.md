@@ -1,60 +1,154 @@
 # 030. channel 关闭 - 面试追问
 
-## 追问与参考答案
+## 1. channel 应该由发送方还是接收方关闭？
 
-### 1. 如果继续追问底层机制，回答应该深入到什么程度？
+通常由发送方关闭，更准确地说，由能确定“不会再有发送”的一方关闭。
 
-不要停在一句结论上，要沿着“语言语义 -> 运行时或编译器机制 -> 工程影响”的顺序回答。
+单生产者：
 
-- close 会唤醒等待接收者，并让后续接收立即完成。
-- 关闭 channel 是广播“无更多数据”的信号，不是“取消正在发送者”的机制。
-- 只有能确定不会再发送的一方，才有资格关闭 channel。
-- 多个发送方需要额外协调，例如 context、done channel、WaitGroup 或单独 owner。
+```go
+func produce(out chan<- int) {
+	defer close(out)
+	for i := 0; i < 3; i++ {
+		out <- i
+	}
+}
+```
 
-面试时可以先用一句话建立主线，再展开关键细节。这样既能让初学者听懂，也能让面试官看到你不是死记硬背。
+接收方：
 
-### 2. 这个知识点在真实项目里怎么取舍？
+```go
+for v := range out {
+	fmt.Println(v)
+}
+```
 
-核心不是知道某个 API 或语法能用，而是知道什么时候该用、什么时候不该用。
+接收方主动关闭数据 channel，可能导致发送方 panic：
 
-- 单生产者多消费者时，生产者完成后关闭数据 channel。
-- 多生产者时，等待所有生产者退出后由协调者关闭 channel。
-- 只需要取消信号时，关闭只读 done channel 或使用 context。
-- 不需要通知接收方结束时，可以不关闭 channel，让它随对象生命周期回收。
+```go
+func consume(ch chan int) {
+	close(ch) // 不推荐
+}
+```
 
-如果一个选择会影响可读性、性能、并发安全或 API 兼容性，要把这些代价说出来，而不是只给“用 A”或“用 B”的答案。
+## 2. 关闭 channel 后接收会返回什么？
 
-### 3. 这道题最容易追问哪些坑？
+如果缓冲里还有值，先返回缓冲值，`ok=true`。读完后返回零值，`ok=false`。
 
-面试官通常会从边界条件和反例继续问，因为这些地方最能区分“会背”和“真懂”。
+```go
+ch := make(chan int, 1)
+ch <- 7
+close(ch)
 
-- 接收方主动关闭数据 channel，导致发送方 panic。
-- 多个发送方竞争 close，用 recover 掩盖设计问题。
-- 把关闭 channel 当成释放资源，忽略 goroutine 是否退出。
-- 从已关闭 channel 读取零值时忘记检查 ok。
+v, ok := <-ch
+fmt.Println(v, ok) // 7 true
 
-回答这类追问时，最好先指出错误直觉，再解释为什么错，最后给出正确写法或规避方式。
+v, ok = <-ch
+fmt.Println(v, ok) // 0 false
+```
 
-### 4. 如何证明你的判断是对的？
+`for range ch` 会一直读到 `ok=false` 后退出。
 
-Go 很适合用小实验验证语言语义，也适合用工具验证性能和并发问题。
+## 3. 为什么从关闭 channel 读零值时必须检查 `ok`？
 
-- 写测试覆盖关闭后接收、发送 panic、nil channel close。
-- 用 race detector 和并发测试检查多发送方关闭路径。
-- 通过 goroutine profile 验证关闭或取消后接收者退出。
+因为零值可能是合法数据。
 
-如果问题涉及并发，优先想到 `go test -race`、goroutine profile、block profile 或 trace；如果涉及性能，优先想到 benchmark、`-benchmem`、pprof 和逃逸分析。
+```go
+ch := make(chan int)
+close(ch)
 
-### 5. 当规模变大后，这个问题会如何升级？
+v := <-ch
+fmt.Println(v) // 0
+```
 
-很多 Go 基础题在小程序里只是语法点，在服务端工程里会变成资源、稳定性和可维护性问题。
+你无法知道这个 `0` 是发送方发送的，还是 channel 关闭后的零值。
 
-- 简单 pipeline 中关闭规则很直观。
-- 多生产者、多消费者系统中应把关闭职责设计成单一 owner。
-- 服务关闭时 channel close 只是一环，还要等待任务完成和释放外部资源。
+正确写法：
 
-面试中可以主动补一句规模化后的影响，这会让答案从“语言知识”升级成“工程判断”。
+```go
+v, ok := <-ch
+if !ok {
+	return
+}
+use(v)
+```
 
-### 6. 初学者应该怎么把这个问题学扎实？
+如果用 `range`，Go 会自动处理 `ok`：
 
-建议按三个层次学习：先写最小可运行例子确认语义，再读官方文档或标准库用法，最后用测试、benchmark 或 profile 观察真实行为。不要只背结论；每个结论都要能回答“为什么”和“在哪些条件下不成立”。
+```go
+for v := range ch {
+	use(v)
+}
+```
+
+## 4. 多个发送方时如何安全关闭 channel？
+
+不要让多个发送方各自 close。用 `WaitGroup` 等所有发送方结束后，由一个协调者关闭。
+
+```go
+out := make(chan Result)
+var wg sync.WaitGroup
+
+for _, job := range jobs {
+	wg.Add(1)
+	go func(job Job) {
+		defer wg.Done()
+		out <- handle(job)
+	}(job)
+}
+
+go func() {
+	wg.Wait()
+	close(out)
+}()
+
+for r := range out {
+	consume(r)
+}
+```
+
+这样 close 只发生一次，并且一定在所有发送完成之后。
+
+## 5. close 能不能作为取消发送方的机制？
+
+不能关闭数据 channel 来取消发送方。发送方继续发送会 panic。
+
+错误方向：
+
+```go
+close(jobs) // 接收方关闭，生产者可能还在 jobs <- job
+```
+
+取消应该用 context 或 done channel：
+
+```go
+func producer(ctx context.Context, out chan<- Job) {
+	for {
+		select {
+		case out <- nextJob():
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
+数据 channel 的 close 表示“没有更多数据”；取消信号表示“请停止工作”。两者语义不同。
+
+## 6. channel 是否一定要关闭？
+
+不一定。
+
+只有接收方需要知道结束时才需要关闭，比如：
+
+```go
+for v := range ch {
+	process(v)
+}
+```
+
+如果 channel 只是对象内部通信，生命周期随对象结束，没有 goroutine 等待结束信号，可以不关闭。
+
+关闭不是释放内存的必要动作。channel 没有引用后会被 GC 回收。
+
+面试里可以总结：需要通知接收方“不会再有值”才 close；否则不必为了形式主义 close。

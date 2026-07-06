@@ -6,63 +6,216 @@ worker pool 和 pipeline 怎么设计？
 
 ## 先给结论
 
-worker pool 控制并发度，pipeline 组织多阶段数据流。深问重点是背压、取消、错误传播、关闭顺序、资源上限和慢阶段处理。
+worker pool 用固定数量 worker 处理任务，核心目的是限制并发度和资源占用。
 
-## 深入理解
+pipeline 把处理过程拆成多个阶段，每个阶段从上游接收数据，处理后发送到下游。
 
-### 1. 这道题真正考察什么
+面试重点不是画出 channel，而是讲清楚：
 
-- 是否能说明 worker 数量由 CPU、I/O、下游限额和任务耗时决定。
-- 是否能解释 pipeline 每个阶段的输入、输出和关闭责任。
-- 是否知道任何阶段失败都要取消其他阶段。
-- 是否能处理结果收集、错误收集和 goroutine 退出。
+- 谁关闭 channel。
+- 错误如何返回。
+- 取消如何传播。
+- 下游提前退出时上游如何停止。
+- worker 数量和缓冲大小如何决定。
 
-### 2. 底层机制要讲清楚
-
-- worker pool 通常由任务队列、固定数量 worker、结果或错误通道组成。
-- pipeline 每个阶段接收上游数据、处理后发送到下游。
-- 有缓冲 channel 可以吸收突发，但也可能隐藏慢消费者。
-- 取消信号必须传到所有可能阻塞的发送和接收点。
-
-### 3. 工程实践怎么取舍
-
-- CPU 密集型 worker 数通常接近 GOMAXPROCS，I/O 密集型根据外部延迟和限额调整。
-- 所有 channel 关闭应由发送方或协调者负责，避免多方 close。
-- 错误发生后关闭 cancel，不再发送新任务，并等待已启动任务收尾。
-- 对外部依赖设置并发上限，防止把压力转嫁给下游。
-
-### 4. 常见误区
-
-- 只关闭结果 channel，不取消仍在发送的上游 goroutine。
-- 任务 channel 无缓冲或过大缓冲都没有结合业务评估。
-- 某个阶段提前返回，导致上游阻塞发送泄漏。
-- worker 数量写死，迁移环境后吞吐或下游压力异常。
-
-## 如何验证理解
-
-- 用压测观察不同 worker 数下的吞吐、延迟和错误率。
-- 用 goroutine profile 检查失败或取消后是否还有阻塞协程。
-- 写测试覆盖下游提前退出、上游报错、context 超时。
-
-## 代码示例
+## 简单 worker pool
 
 ```go
-jobs := make(chan Job)
-for i := 0; i < workerN; i++ {
+type Job struct {
+	ID int
+}
+
+type Result struct {
+	ID  int
+	Err error
+}
+
+func RunPool(ctx context.Context, jobs []Job, workerN int) []Result {
+	jobCh := make(chan Job)
+	resultCh := make(chan Result)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobCh {
+				resultCh <- handle(ctx, job)
+			}
+		}()
+	}
+
 	go func() {
-		for job := range jobs {
-			process(job)
+		defer close(jobCh)
+		for _, job := range jobs {
+			jobCh <- job
 		}
 	}()
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	var results []Result
+	for r := range resultCh {
+		results = append(results, r)
+	}
+	return results
 }
 ```
+
+这个版本能展示结构，但还不完整：发送任务和发送结果都没有监听 `ctx.Done()`，如果下游提前返回，可能泄漏。面试中要能指出这一点。
+
+## 支持取消的发送
+
+发送任务时监听 context：
+
+```go
+go func() {
+	defer close(jobCh)
+	for _, job := range jobs {
+		select {
+		case jobCh <- job:
+		case <-ctx.Done():
+			return
+		}
+	}
+}()
+```
+
+worker 发送结果时也监听：
+
+```go
+select {
+case resultCh <- handle(ctx, job):
+case <-ctx.Done():
+	return
+}
+```
+
+每个可能阻塞的 send/receive 都要考虑取消。
+
+## worker 数量怎么定
+
+CPU 密集型任务：
+
+```go
+workerN := runtime.GOMAXPROCS(0)
+```
+
+I/O 密集型任务要看外部依赖：
+
+- 数据库连接池上限。
+- RPC 对端限流。
+- 磁盘或网络吞吐。
+- 单个任务平均耗时。
+
+不要随手写 `1000`。worker 数本质上是资源上限。
+
+## pipeline 示例
+
+```go
+func gen(ctx context.Context, nums ...int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for _, n := range nums {
+			select {
+			case out <- n:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+func square(ctx context.Context, in <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for n := range in {
+			select {
+			case out <- n * n:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+```
+
+使用：
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+for n := range square(ctx, gen(ctx, 1, 2, 3)) {
+	fmt.Println(n)
+}
+```
+
+每个阶段负责关闭自己的输出 channel。每个阶段都监听取消。
+
+## 下游提前退出要取消上游
+
+错误示例：
+
+```go
+for n := range square(ctx, gen(ctx, nums...)) {
+	if n > 100 {
+		return n // 上游可能还在发送
+	}
+}
+```
+
+正确方向：
+
+```go
+ctx, cancel := context.WithCancel(parent)
+defer cancel()
+
+for n := range square(ctx, gen(ctx, nums...)) {
+	if n > 100 {
+		cancel()
+		return n
+	}
+}
+```
+
+下游不再接收时，要通知上游停止发送。
+
+## 错误传播
+
+简单 worker pool 可以用 error channel 或 result 包含 error。更复杂场景可以用 `errgroup.WithContext`。
+
+```go
+g, ctx := errgroup.WithContext(parent)
+
+for _, job := range jobs {
+	job := job
+	g.Go(func() error {
+		return process(ctx, job)
+	})
+}
+
+if err := g.Wait(); err != nil {
+	return err
+}
+```
+
+`errgroup` 会收集第一个错误，并配合 context 取消其他任务。
 
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“worker pool 和 pipeline”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- worker pool 解决什么问题？
+- worker 数量应该怎么定？
+- pipeline 每个阶段应该由谁关闭 channel？
+- 下游提前退出时为什么会上游泄漏？
+- worker pool 如何处理错误和取消？
+- 有缓冲 channel 在 worker pool 里解决什么，又掩盖什么？

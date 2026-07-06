@@ -6,45 +6,16 @@
 
 ## 先给结论
 
-sync.Once 保证某段初始化逻辑在并发环境下只执行一次，并提供必要的内存可见性。重点是失败处理和重试语义：Once 执行过就不会再执行，即使函数内部失败或 panic。
+`sync.Once` 保证某段函数在并发环境下最多执行一次。常见场景是惰性初始化单例、全局配置、昂贵资源。
 
-## 深入理解
+关键点：
 
-### 1. 这道题真正考察什么
+- `Once` 的语义是“最多执行一次”，不是“成功执行一次”。
+- `Do` 里的函数 panic 后，`Once` 也会认为已经执行过。
+- `Once` 不提供重置能力。
+- 初始化可能失败并且需要重试时，不要直接用普通 `Once` 包住失败逻辑。
 
-- 是否知道 Once 适合惰性初始化单例或昂贵资源。
-- 是否能解释 Once 的并发安全和可见性。
-- 是否知道函数 panic 后 Once 也会认为已经执行过。
-- 是否能处理初始化失败是否允许重试的问题。
-
-### 2. 底层机制要讲清楚
-
-- Once 内部通过原子状态和锁保证只让一个 goroutine 执行函数。
-- 函数执行完成后，其他 goroutine 看到 Once 完成状态，也能看到初始化写入。
-- Once 的语义是“最多执行一次”，不是“成功执行一次”。
-- Once 不提供重置能力，测试或重试需要另行设计。
-
-### 3. 工程实践怎么取舍
-
-- 全局只需要初始化一次且失败不可恢复时，用 Once 简洁可靠。
-- 初始化可能失败且希望重试时，不要直接把失败逻辑塞进 Once。
-- 需要带参数初始化时，Once 要配合明确的配置来源，避免第一次调用参数决定全局状态。
-- 测试中避免全局 Once 污染多个用例，必要时封装成可创建实例。
-
-### 4. 常见误区
-
-- 初始化失败后返回错误，但 Once 阻止后续重试。
-- 第一次调用传入测试配置，后续生产路径复用错误状态。
-- 在 Once 函数里调用依赖自己初始化结果的代码，造成死锁或递归问题。
-- 为了测试强行依赖未公开字段重置 Once。
-
-## 如何验证理解
-
-- 写并发测试确认初始化函数只执行一次。
-- 写失败测试确认失败后是否符合预期重试策略。
-- 用 race detector 验证初始化结果读取无数据竞争。
-
-## 代码示例
+## 基本用法
 
 ```go
 var once sync.Once
@@ -58,12 +29,156 @@ func GetClient() *Client {
 }
 ```
 
+多个 goroutine 同时调用 `GetClient` 时，只有一个 goroutine 会执行初始化函数。其他 goroutine 会等初始化完成，然后看到初始化后的结果。
+
+## 初始化带错误时要小心
+
+常见写法：
+
+```go
+var once sync.Once
+var client *Client
+var initErr error
+
+func GetClient() (*Client, error) {
+	once.Do(func() {
+		client, initErr = NewClient()
+	})
+	return client, initErr
+}
+```
+
+这个写法的语义是：第一次初始化失败后，后续调用不会重试，只会继续返回第一次的错误。
+
+如果这就是你想要的，比如配置错误不可恢复，可以接受。
+
+如果希望下次再试，就不能这样写。可以用锁显式控制：
+
+```go
+type ClientProvider struct {
+	mu     sync.Mutex
+	client *Client
+}
+
+func (p *ClientProvider) Get() (*Client, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.client != nil {
+		return p.client, nil
+	}
+
+	c, err := NewClient()
+	if err != nil {
+		return nil, err
+	}
+	p.client = c
+	return c, nil
+}
+```
+
+这里初始化失败不会缓存错误，下一次调用还会重试。
+
+## panic 后也不会再执行
+
+```go
+var once sync.Once
+
+func Init() {
+	once.Do(func() {
+		panic("failed")
+	})
+}
+```
+
+如果 `Do` 里的函数 panic，这次 `Do` 没有正常返回，但 `Once` 仍然会认为这段函数已经执行过。后续调用不会再执行它。
+
+所以不要把“可能 panic 后再重试”的逻辑放进 `sync.Once`。
+
+## 带参数初始化要谨慎
+
+错误方向：
+
+```go
+var once sync.Once
+var client *Client
+
+func GetClient(dsn string) *Client {
+	once.Do(func() {
+		client = NewClientWithDSN(dsn)
+	})
+	return client
+}
+```
+
+第一次调用传入的 `dsn` 决定了全局 client。后续调用即使传不同参数也无效。
+
+更清楚的做法是配置来源固定：
+
+```go
+func NewClientProvider(dsn string) *ClientProvider {
+	return &ClientProvider{dsn: dsn}
+}
+
+type ClientProvider struct {
+	once   sync.Once
+	dsn    string
+	client *Client
+	err    error
+}
+
+func (p *ClientProvider) Get() (*Client, error) {
+	p.once.Do(func() {
+		p.client, p.err = NewClientWithDSN(p.dsn)
+	})
+	return p.client, p.err
+}
+```
+
+参数在构造 provider 时确定，而不是由第一次调用偷偷决定。
+
+## 测试里不要依赖全局 Once 可重置
+
+全局 Once 会污染测试：
+
+```go
+var once sync.Once
+var cfg Config
+```
+
+一个测试初始化后，另一个测试很难换配置。
+
+更好的方式是封装成实例：
+
+```go
+type Loader struct {
+	once sync.Once
+	cfg  Config
+	err  error
+	path string
+}
+
+func NewLoader(path string) *Loader {
+	return &Loader{path: path}
+}
+
+func (l *Loader) Config() (Config, error) {
+	l.once.Do(func() {
+		l.cfg, l.err = LoadConfig(l.path)
+	})
+	return l.cfg, l.err
+}
+```
+
+每个测试创建自己的 `Loader`，互不影响。
+
 ## 面试追问
 
 追问参考答案：[follow-ups.md](follow-ups.md)
 
-- 如果继续追问“sync.Once”的底层机制，应该讲到哪些层次？
-- 这个知识点在真实项目里应该如何取舍？
-- 最容易踩的坑是什么？为什么这些坑不是背结论就能避免的？
-- 如何用测试、工具或 profiling 验证自己的判断？
-- 当数据量、并发量或团队规模变大后，这个问题会怎样升级？
+- `sync.Once` 保证的是成功一次还是最多一次？
+- `Do` 里的函数返回错误时，后续会不会重试？
+- `Do` 里的函数 panic 后，后续会不会重试？
+- 带参数的初始化为什么容易被第一次调用污染？
+- 测试中全局 Once 有什么问题？
+- 什么时候不用 Once，改用显式初始化更好？
